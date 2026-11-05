@@ -229,12 +229,21 @@ class Database:
     async def undigested_posts(self, since: datetime) -> list[Post]:
         async with self.conn.execute(
             "SELECT p.* FROM posts p JOIN channels c ON c.id = p.channel_id"
-            " WHERE p.digest_id IS NULL AND p.status = 'processed' AND p.posted_at >= ?"
+            " WHERE p.digest_id IS NULL AND p.posted_at >= ?"
             " ORDER BY p.posted_at",
             (since.astimezone(timezone.utc).isoformat(),),
         ) as cur:
             rows = await cur.fetchall()
         return [_row_to_post(r) for r in rows]
+
+    async def reset_undigested(self) -> int:
+        """Возвращает в очередь на обработку посты, ещё не попавшие в дайджест."""
+        cur = await self.conn.execute(
+            "UPDATE posts SET status = 'new', is_ad = 0, summary = '', summarized = 0"
+            " WHERE digest_id IS NULL AND status = 'processed'"
+        )
+        await self.conn.commit()
+        return cur.rowcount
 
     async def recent_posts(self, limit: int, tag: str | None = None) -> list[tuple[Post, Channel]]:
         async with self.conn.execute(

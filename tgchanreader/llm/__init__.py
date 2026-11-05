@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Any
 
 import httpx
@@ -27,28 +28,88 @@ class LLMError(Exception):
     pass
 
 
+class LLMHTTPError(LLMError):
+    def __init__(self, status: int, message: str):
+        super().__init__(f"HTTP {status}: {message}")
+        self.status = status
+        self.message = message
+
+
+# Ошибки, которые не исправятся повтором запроса (ключ, модель, настройки аккаунта).
+FATAL_STATUSES = {400, 401, 402, 403, 404}
+FATAL_PAUSE_SECONDS = 600
+
+
+def _error_message(resp: httpx.Response) -> str:
+    try:
+        data = resp.json()
+    except ValueError:
+        return resp.text[:300]
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("message") or err)[:500]
+    if err:
+        return str(err)[:500]
+    return resp.text[:300]
+
+
 class LLMClient:
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
         self._http = httpx.AsyncClient(timeout=cfg.timeout)
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
+        self._paused_until = 0.0
+        self.last_error = ""
+        self.last_error_at: float | None = None
+        self.last_ok_at: float | None = None
 
     async def close(self) -> None:
         await self._http.aclose()
 
+    def reset(self) -> None:
+        self._paused_until = 0.0
+
+    @property
+    def paused(self) -> bool:
+        return time.monotonic() < self._paused_until
+
+    def _fail(self, message: str) -> None:
+        self.last_error = message
+        self.last_error_at = time.time()
+
     async def complete(self, system: str, user: str, max_tokens: int = 2000) -> str:
         async with self._sem:
+            if self.paused:
+                # уже знаем, что запросы не проходят — не долбим API и не спамим лог
+                raise LLMError(self.last_error)
             last_exc: Exception | None = None
             for attempt in range(3):
                 try:
-                    return await self._complete(system, user, max_tokens)
+                    text = await self._complete(system, user, max_tokens)
+                    self.last_ok_at = time.time()
+                    self.last_error = ""
+                    return text
+                except LLMHTTPError as exc:
+                    last_exc = exc
+                    if exc.status in FATAL_STATUSES:
+                        self._paused_until = time.monotonic() + FATAL_PAUSE_SECONDS
+                        self._fail(exc.message)
+                        log.error(
+                            "LLM %s (%s) отклонил запрос, HTTP %s: %s. "
+                            "Запросы приостановлены на %d мин, посты подождут. Проверьте ключ, "
+                            "LLM_MODEL и настройки аккаунта; проверка в боте: /llmtest",
+                            self.cfg.provider, self.cfg.model, exc.status, exc.message,
+                            FATAL_PAUSE_SECONDS // 60,
+                        )
+                        raise LLMError(exc.message) from exc
                 except (httpx.HTTPError, LLMError) as exc:
                     last_exc = exc
-                    status = getattr(getattr(exc, "response", None), "status_code", None)
-                    if status in (400, 401, 403, 404):
-                        break
+                if attempt < 2:
                     await asyncio.sleep(2 ** attempt * 2)
-            raise LLMError(f"LLM-запрос не удался: {last_exc}") from last_exc
+            message = f"{type(last_exc).__name__}: {last_exc}"
+            self._fail(message)
+            log.warning("LLM %s: запрос не удался после 3 попыток: %s", self.cfg.provider, message)
+            raise LLMError(message) from last_exc
 
     async def _complete(self, system: str, user: str, max_tokens: int) -> str:
         raise NotImplementedError
@@ -79,8 +140,7 @@ class OpenAICompatibleClient(LLMClient):
             f"{self.cfg.base_url}/chat/completions", headers=headers, json=payload
         )
         if resp.status_code >= 400:
-            log.error("LLM %s: HTTP %s %s", self.cfg.provider, resp.status_code, resp.text[:500])
-            resp.raise_for_status()
+            raise LLMHTTPError(resp.status_code, _error_message(resp))
         data = resp.json()
         if "error" in data:
             raise LLMError(str(data["error"]))
@@ -109,8 +169,7 @@ class AnthropicClient(LLMClient):
         }
         resp = await self._http.post(f"{self.cfg.base_url}/v1/messages", headers=headers, json=payload)
         if resp.status_code >= 400:
-            log.error("LLM anthropic: HTTP %s %s", resp.status_code, resp.text[:500])
-            resp.raise_for_status()
+            raise LLMHTTPError(resp.status_code, _error_message(resp))
         data = resp.json()
         parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
         return "".join(parts)

@@ -72,6 +72,7 @@ class ProcessStats:
     ads: int = 0
     summarized: int = 0
     llm_errors: int = 0
+    deferred: int = 0
 
 
 class Processor:
@@ -88,13 +89,26 @@ class Processor:
             post.summary = truncate(post.text, self.cfg.summary_max_chars)
             post.summarized = True
 
-    async def process_pending(self) -> ProcessStats:
+    def apply_fallback(self, post: Post) -> None:
+        """Обработка без LLM: эвристики рекламы и обрезка (без записи в БД)."""
+        post.is_ad = bool(post.text.strip()) and heuristic_is_ad(post.text)
+        if not post.is_ad:
+            self._fallback(post)
+
+    async def process_pending(self, final: bool = False) -> ProcessStats:
+        """Обрабатывает новые посты.
+
+        Если LLM недоступен и final=False, посты остаются в очереди и будут
+        обработаны нейросетью позже. При final=True (сборка дайджеста) для них
+        используется упрощённая обработка, чтобы дайджест всё равно пришёл.
+        """
         stats = ProcessStats()
         posts = await self.db.posts_by_status("new")
         if not posts:
             return stats
 
         to_llm: list[Post] = []
+        done: list[Post] = []
         for post in posts:
             if post.media_only or not post.text.strip():
                 post.is_ad = False
@@ -106,31 +120,51 @@ class Processor:
             else:
                 self._fallback(post)
             await self.db.save_processing(post)
+            done.append(post)
         await self.db.commit()
+
+        if to_llm and self.llm and self.llm.paused and not final:
+            stats.deferred = len(to_llm)
+            to_llm = []
 
         if to_llm:
             batches = self._batches(to_llm)
             results = await asyncio.gather(
                 *(self._process_batch(b) for b in batches), return_exceptions=True
             )
+            errors: list[str] = []
             for batch, res in zip(batches, results):
                 if isinstance(res, Exception):
-                    log.warning("Ошибка LLM, используем упрощённую обработку: %s", res)
                     stats.llm_errors += 1
+                    errors.append(str(res))
+                    if not final:
+                        stats.deferred += len(batch)
+                        continue
                     for post in batch:
                         self._fallback(post)
                 for post in batch:
                     await self.db.save_processing(post)
+                    done.append(post)
             await self.db.commit()
+            if errors:
+                action = (
+                    "упрощённая обработка (обрезка текста)" if final
+                    else "посты отложены до следующей попытки"
+                )
+                log.warning(
+                    "LLM: ошибок в %d из %d пачек, %s. Первая ошибка: %s",
+                    len(errors), len(batches), action, errors[0][:300],
+                )
 
-        for post in posts:
+        for post in done:
             stats.processed += 1
             stats.ads += int(post.is_ad)
             stats.summarized += int(post.summarized)
-        log.info(
-            "Обработано постов: %d (реклама: %d, сокращено: %d)",
-            stats.processed, stats.ads, stats.summarized,
-        )
+        if stats.processed or stats.deferred:
+            log.info(
+                "Обработано постов: %d (реклама: %d, сокращено: %d), отложено: %d",
+                stats.processed, stats.ads, stats.summarized, stats.deferred,
+            )
         return stats
 
     def _batches(self, posts: list[Post]) -> list[list[Post]]:

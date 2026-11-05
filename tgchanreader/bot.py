@@ -14,6 +14,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import BotCommand, Message, TelegramObject
 
 from .digest import Digest, esc, split_blocks
+from .llm import LLMError
 from .models import Channel, parse_tags
 from .service import Service
 from .sources import SourceError
@@ -42,6 +43,8 @@ HELP = """<b>Бот-дайджест Telegram-каналов</b>
 /digest — собрать и прислать дайджест прямо сейчас
 /preview [тег] — посмотреть, что попадёт в дайджест (без отметки прочитанным)
 /status — статистика
+/llmtest — проверить подключение к нейросети
+/reprocess — заново обработать нейросетью посты, ещё не попавшие в дайджест
 """
 
 
@@ -291,8 +294,51 @@ class TelegramBot:
                 f"Отфильтровано рекламы всего: {st['ads_total']}\n"
                 f"Дайджестов отправлено: {st['digests']}\n"
                 f"Источник: {cfg.effective_source} · LLM: {esc(llm)}\n"
-                f"Следующий дайджест: {nxt} ({cfg.timezone})"
+                + (f"⚠️ Ошибка LLM: <code>{esc(svc.llm.last_error[:300])}</code>\n"
+                   if svc.llm and svc.llm.last_error else "")
+                + f"Следующий дайджест: {nxt} ({cfg.timezone})"
             )
+
+        @r.message(Command("llmtest"))
+        async def llmtest(message: Message) -> None:
+            if not svc.llm:
+                await message.answer("LLM выключен (LLM_PROVIDER=none или не задан LLM_API_KEY).")
+                return
+            svc.llm.reset()
+            try:
+                answer = await svc.llm.complete(
+                    "Отвечай одним словом.", "Напиши слово «работает».", max_tokens=20
+                )
+            except LLMError as exc:
+                await message.answer(
+                    f"❌ {esc(cfg.llm.provider)} / <code>{esc(cfg.llm.model)}</code>\n"
+                    f"<code>{esc(str(exc)[:800])}</code>"
+                )
+                return
+            await message.answer(
+                f"✅ {esc(cfg.llm.provider)} / <code>{esc(cfg.llm.model)}</code> отвечает: "
+                f"{esc(answer.strip()[:100])}\nЧтобы переобработать посты: /reprocess"
+            )
+
+        @r.message(Command("reprocess"))
+        async def reprocess(message: Message) -> None:
+            if not svc.llm:
+                await message.answer("LLM выключен — переобрабатывать нечем.")
+                return
+            svc.llm.reset()
+            count = await svc.db.reset_undigested()
+            await message.answer(f"⏳ Переобрабатываю постов: {count}…")
+            stats = await svc.processor.process_pending()
+            text = (
+                f"✅ Готово: обработано {stats.processed}, реклама {stats.ads}, "
+                f"сокращено {stats.summarized}"
+            )
+            if stats.deferred:
+                text += (
+                    f"\n⚠️ Отложено {stats.deferred}: LLM не отвечает "
+                    f"(<code>{esc(svc.llm.last_error[:300])}</code>)"
+                )
+            await message.answer(text)
 
         @r.message(F.forward_origin)
         async def forwarded(message: Message) -> None:
@@ -326,6 +372,8 @@ class TelegramBot:
                 BotCommand(command="tag", description="Теги канала"),
                 BotCommand(command="priority", description="Приоритет канала"),
                 BotCommand(command="status", description="Статус"),
+                BotCommand(command="llmtest", description="Проверить нейросеть"),
+                BotCommand(command="reprocess", description="Переобработать посты нейросетью"),
                 BotCommand(command="help", description="Помощь"),
             ]
         )

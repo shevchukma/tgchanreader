@@ -27,6 +27,12 @@ class FakeSource(Source):
 
 
 class FakeLLM:
+    paused = False
+    last_error = ""
+
+    def reset(self):
+        pass
+
     def __init__(self, ads: set[str] | None = None):
         self.ads = ads or set()
         self.calls = 0

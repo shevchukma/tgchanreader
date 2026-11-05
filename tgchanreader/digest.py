@@ -173,7 +173,7 @@ class DigestBuilder:
         self.processor = processor
 
     async def build(self, tag: str | None = None, save: bool = True) -> Digest | None:
-        await self.processor.process_pending()
+        await self.processor.process_pending(final=save)
         now = datetime.now(timezone.utc)
         since = now - timedelta(hours=self.cfg.max_post_age_hours)
         posts = await self.db.undigested_posts(since)
@@ -185,6 +185,9 @@ class DigestBuilder:
             channel = channels.get(post.channel_id)
             if channel is None:
                 continue
+            if post.status == "new":
+                # ещё не обработан нейросетью (только в предпросмотре) — упрощённо, без сохранения
+                self.processor.apply_fallback(post)
             if tag and tag not in channel.tags:
                 continue
             if post.is_ad and self.cfg.skip_ads:
