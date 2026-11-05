@@ -33,14 +33,17 @@ def heuristic_is_ad(text: str) -> bool:
 # Обязательная плашка «иностранного агента» (стандартный текст по закону РФ).
 _FA_WORDS = re.compile(r"иностранн\w*\s+агент", re.I)
 _FA_OPENING = re.compile(
-    r"^\W*(данн\w+|настоящ\w+|это\w*)\s+(сообщени\w*|материал\w*|информаци\w*)", re.I
+    r"^\W*(?:18\+\W*)?(данн\w+|настоящ\w+|это\w*)\s+(сообщени\w*|материал\w*|информаци\w*)", re.I
 )
 # та же плашка капсом (в том числе внутри строки с обычным текстом) — до точки и «18+»
 _CAPS = r"[А-ЯЁA-Z0-9()«»\"',:;\-–— ]"
 _FA_CAPS = re.compile(
-    rf"(?:ДАНН[А-ЯЁ]+|НАСТОЯЩ[А-ЯЁ]+|ЭТО[А-ЯЁ]*)\s+(?:СООБЩЕНИ|МАТЕРИАЛ|ИНФОРМАЦИ)[А-ЯЁ]*"
+    rf"(?:18\+\s*)?(?:ДАНН[А-ЯЁ]+|НАСТОЯЩ[А-ЯЁ]+|ЭТО[А-ЯЁ]*)\s+(?:СООБЩЕНИ|МАТЕРИАЛ|ИНФОРМАЦИ)[А-ЯЁ]*"
     rf"{_CAPS}*?ИНОСТРАНН[А-ЯЁ]*\s+АГЕНТ{_CAPS}*\.?(?:\s*18\+)?"
 )
+
+
+_ALIAS_RE = re.compile(r"^\s*\([^()\n]{2,80}\)\s*\.?\s*$")
 
 
 def strip_disclaimers(text: str) -> str:
@@ -49,15 +52,23 @@ def strip_disclaimers(text: str) -> str:
         return text
     lines = []
     removed = False
+    after_label = False  # предыдущая непустая строка была плашкой
     for line in text.split("\n"):
+        # пояснение к имени сразу после плашки: «(Архиепископа Григория)»
+        if after_label and _ALIAS_RE.match(line):
+            after_label = False
+            continue
+        if line.strip():
+            after_label = False
         # строка начинается с плашки, написанной обычным регистром
         if _FA_WORDS.search(line) and len(line) < 700 and _FA_OPENING.match(line):
-            removed = True
+            removed = after_label = True
             continue
         cleaned = re.sub(r"\s{2,}", " ", _FA_CAPS.sub("", line)) if _FA_CAPS.search(line) else line
         if cleaned != line:
             removed = True
             if not cleaned.strip():
+                after_label = True
                 continue
         lines.append(cleaned.rstrip())
     if removed:
