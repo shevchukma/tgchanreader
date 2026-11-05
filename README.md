@@ -202,10 +202,13 @@ LLM_MODEL=qwen2.5:7b
 
 GitHub Actions (`.github/workflows/docker.yml`) прогоняет тесты и собирает образ для `linux/amd64` и `linux/arm64`.
 При пуше в `main` образ публикуется как `velikoross/tgchanreader:latest`, при теге `v1.2.3` — как `1.2.3` и `1.2`.
-Для этого в настройках репозитория (*Settings → Secrets and variables → Actions*) добавьте секреты:
+Для этого в настройках репозитория (*Settings → Secrets and variables → Actions → New repository secret*) добавьте секрет:
 
-* `DOCKERHUB_USERNAME` — `velikoross`
-* `DOCKERHUB_TOKEN` — токен доступа с [hub.docker.com/settings/security](https://hub.docker.com/settings/security)
+* `DOCKERHUB_TOKEN` — токен доступа с [app.docker.com/settings/personal-access-tokens](https://app.docker.com/settings/personal-access-tokens)
+  (права *Read & Write*).
+* `DOCKERHUB_USERNAME` — необязательно, по умолчанию `velikoross`.
+
+Без токена workflow не падает: образ собирается для проверки, но не публикуется (в сводке будет предупреждение).
 
 Собрать вручную:
 
