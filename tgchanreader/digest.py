@@ -1,9 +1,16 @@
-"""Сборка и рендеринг дайджеста."""
+"""Сборка и рендеринг дайджеста.
+
+Дайджест — это шапка (заголовок, статистика, «Главное») и по одному сообщению
+на канал. Если пост канала не помещаются в одно сообщение Telegram, нейросеть
+отбирает важное и сжимает остальное; без нейросети сообщение делится на части.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from itertools import groupby
@@ -15,8 +22,9 @@ from .processor import Processor, truncate
 
 log = logging.getLogger(__name__)
 
+# Telegram ограничивает сообщение 4096 символами (UTF-16) ПОСЛЕ разбора HTML-разметки.
 TELEGRAM_LIMIT = 4096
-CHUNK_LIMIT = 3900
+MESSAGE_LIMIT = 4000
 
 PRIORITY_ICONS = {1: "🔴", 2: "🟠", 3: "🟡"}
 MEDIA_ICONS = {
@@ -37,6 +45,8 @@ MONTHS = [
     "июля", "августа", "сентября", "октября", "ноября", "декабря",
 ]
 
+_TAG_RE = re.compile(r"<[^>]+>")
+
 
 def esc(text: str) -> str:
     return html.escape(text, quote=False)
@@ -50,42 +60,40 @@ def human_date(dt: datetime) -> str:
     return f"{dt.day} {MONTHS[dt.month - 1]} {dt.year}"
 
 
-@dataclass
-class Digest:
-    title: str
-    blocks: list[str]
-    stats: dict[str, int]
-    post_ids: list[int] = field(default_factory=list)
-    id: int | None = None
-
-    @property
-    def html(self) -> str:
-        return "\n".join(self.blocks).strip()
-
-    def chunks(self, limit: int = CHUNK_LIMIT) -> list[str]:
-        return split_blocks(self.blocks, limit)
+def visible_len(text: str) -> int:
+    """Длина текста так, как её считает Telegram: без тегов, в UTF-16."""
+    plain = html.unescape(_TAG_RE.sub("", text))
+    return len(plain.encode("utf-16-le")) // 2
 
 
-def split_blocks(blocks: list[str], limit: int = CHUNK_LIMIT) -> list[str]:
+def split_blocks(blocks: list[str], limit: int = MESSAGE_LIMIT, sep: str = "\n") -> list[str]:
     """Склеивает блоки в сообщения не длиннее limit, не разрывая HTML внутри блока."""
     chunks: list[str] = []
-    current = ""
+    current: list[str] = []
+    size = 0
+    sep_len = visible_len(sep)
     for block in blocks:
-        if len(block) > limit:
-            # аварийный случай: режем по строкам
+        block_len = visible_len(block)
+        if block_len > limit:
+            # аварийный случай: блок сам по себе огромный — режем по строкам
             for line in block.split("\n"):
-                line = line[:limit]
-                if len(current) + len(line) + 1 > limit:
-                    chunks.append(current.strip())
-                    current = ""
-                current += line + "\n"
+                line_len = visible_len(line)
+                if line_len > limit:
+                    line = esc(truncate(html.unescape(_TAG_RE.sub("", line)), limit - 10))
+                    line_len = visible_len(line)
+                if current and size + sep_len + line_len > limit:
+                    chunks.append(sep.join(current).strip())
+                    current, size = [], 0
+                current.append(line)
+                size += line_len + sep_len
             continue
-        if current and len(current) + len(block) + 1 > limit:
-            chunks.append(current.strip())
-            current = ""
-        current += block + "\n"
-    if current.strip():
-        chunks.append(current.strip())
+        if current and size + sep_len + block_len > limit:
+            chunks.append(sep.join(current).strip())
+            current, size = [], 0
+        current.append(block)
+        size += block_len + sep_len
+    if current and sep.join(current).strip():
+        chunks.append(sep.join(current).strip())
     return chunks
 
 
@@ -93,10 +101,18 @@ def media_label(media: list[str]) -> str:
     return ", ".join(MEDIA_LABELS.get(m, m) for m in media)
 
 
-def render_post(post: Post, cfg: Config) -> str:
-    local_time = post.posted_at.astimezone(cfg.tz).strftime("%H:%M")
-    url = esc_attr(post.url)
+def _time(post: Post, cfg: Config) -> str:
+    return post.posted_at.astimezone(cfg.tz).strftime("%H:%M")
+
+
+def _icons(post: Post) -> str:
     icons = "".join(MEDIA_ICONS.get(m, "") for m in post.media if m != "link")
+    return f" {icons}" if icons else ""
+
+
+def render_post(post: Post, cfg: Config) -> str:
+    local_time = _time(post, cfg)
+    url = esc_attr(post.url)
 
     if post.media_only:
         icon = MEDIA_ICONS.get(post.media[0], "📎")
@@ -113,57 +129,82 @@ def render_post(post: Post, cfg: Config) -> str:
         body = esc(truncate(post.text, cfg.short_post_max_chars))
         link = f'<a href="{url}">оригинал</a>'
         prefix = ""
-    media_note = f" {icons}" if icons else ""
-    return f"▫️ <i>{local_time}</i>{media_note} {prefix}{body}\n    → {link}"
+    return f"▫️ <i>{local_time}</i>{_icons(post)} {prefix}{body}\n    → {link}"
 
 
-def _sort_key(item: tuple[Post, Channel]) -> tuple:
+def render_compact(post: Post, text: str, cfg: Config) -> str:
+    """Короткая строка для сжатого режима: время — ссылка на пост."""
+    url = esc_attr(post.url)
+    if post.media_only:
+        icon = MEDIA_ICONS.get(post.media[0], "📎")
+        body = f"{icon} <i>только медиа ({esc(media_label(post.media))})</i>"
+    else:
+        body = esc(text)
+    icons = "" if post.media_only else _icons(post)
+    return f'▫️ <a href="{url}">{_time(post, cfg)}</a>{icons} {body}'
+
+
+def channel_header(channel: Channel, count: int, note: str = "") -> str:
+    icon = PRIORITY_ICONS.get(channel.priority, "⚪")
+    line = f'{icon} <b><a href="{esc_attr(channel.link)}">{esc(channel.display_name)}</a></b>'
+    tags = " ".join(f"#{esc(t)}" for t in channel.tags)
+    meta = [f"{count} {plural(count, 'пост', 'поста', 'постов')}"]
+    if note:
+        meta.append(note)
+    line += "\n<i>" + (f"{tags} · " if tags else "") + " · ".join(meta) + "</i>"
+    return line
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n) % 100
+    if 11 <= n <= 19:
+        return many
+    n %= 10
+    if n == 1:
+        return one
+    if 2 <= n <= 4:
+        return few
+    return many
+
+
+def sort_key(item: tuple[Post, Channel]) -> tuple:
     post, ch = item
     tag = ch.primary_tag
     return (ch.priority, tag == "", tag, ch.display_name.lower(), ch.id, post.posted_at)
 
 
-def render_digest(
-    entries: list[tuple[Post, Channel]],
-    cfg: Config,
-    title: str,
-    stats: dict[str, int],
-    overview: str = "",
-) -> list[str]:
-    blocks: list[str] = []
-    header = f"📰 <b>{esc(title)}</b>\n"
-    header += f"Постов: {stats['posts']} · каналов: {stats['channels']}"
-    if stats.get("ads"):
-        header += f" · пропущено рекламы: {stats['ads']}"
-    blocks.append(header)
+@dataclass
+class Section:
+    channel: Channel
+    posts: list[Post]
+    parts: list[str] = field(default_factory=list)
+    compressed: bool = False
+    dropped: int = 0
 
-    if overview:
-        blocks.append(f"\n🧭 <b>Главное за день</b>\n{esc(overview)}")
 
-    entries = sorted(entries, key=_sort_key)
-    for priority, by_priority in groupby(entries, key=lambda e: e[1].priority):
-        icon = PRIORITY_ICONS.get(priority, "⚪")
-        blocks.append(f"\n{icon} <b>ПРИОРИТЕТ {priority}</b>")
-        by_priority = list(by_priority)
-        tags_in_priority = {e[1].primary_tag for e in by_priority}
-        show_tags = tags_in_priority != {""}
-        for tag, by_tag in groupby(by_priority, key=lambda e: e[1].primary_tag):
-            if show_tags:
-                tag_title = f"#{esc(tag)}" if tag else "без тега"
-                blocks.append(f"\n🏷 <b>{tag_title}</b>")
-            for _, by_channel in groupby(by_tag, key=lambda e: e[1].id):
-                items = list(by_channel)
-                channel = items[0][1]
-                extra_tags = " ".join(f"#{esc(t)}" for t in channel.tags[1:])
-                ch_line = (
-                    f'\n📢 <b><a href="{esc_attr(channel.link)}">{esc(channel.display_name)}</a></b>'
-                )
-                if extra_tags:
-                    ch_line += f" <i>{extra_tags}</i>"
-                blocks.append(ch_line)
-                for post, _ in items:
-                    blocks.append(render_post(post, cfg))
-    return blocks
+@dataclass
+class Digest:
+    title: str
+    header: str
+    sections: list[Section]
+    stats: dict[str, int]
+    post_ids: list[int] = field(default_factory=list)
+    id: int | None = None
+
+    def messages(self) -> list[str]:
+        """Шапка + по сообщению на канал (длинные каналы без LLM — в несколько сообщений)."""
+        result = [self.header]
+        for section in self.sections:
+            result.extend(section.parts)
+        return result
+
+    # совместимость со старым API
+    def chunks(self) -> list[str]:
+        return self.messages()
+
+    @property
+    def html(self) -> str:
+        return "\n\n".join(self.messages()).strip()
 
 
 class DigestBuilder:
@@ -171,6 +212,77 @@ class DigestBuilder:
         self.cfg = cfg
         self.db = db
         self.processor = processor
+
+    # ---------- секции каналов ----------
+
+    def _render_full(self, section: Section) -> list[str]:
+        header = channel_header(section.channel, len(section.posts))
+        blocks = [render_post(p, self.cfg) for p in section.posts]
+        text = header + "\n\n" + "\n\n".join(blocks)
+        if visible_len(text) <= MESSAGE_LIMIT:
+            return [text]
+        # не влезает и сжать нечем — делим на части с повтором заголовка
+        cont = channel_header(section.channel, len(section.posts), "продолжение")
+        budget = MESSAGE_LIMIT - visible_len(cont) - 2
+        chunks = split_blocks(blocks, budget, sep="\n\n")
+        return [(header if i == 0 else cont) + "\n\n" + c for i, c in enumerate(chunks)]
+
+    async def _compress(self, section: Section) -> list[str] | None:
+        """Отбор и сжатие постов канала нейросетью, чтобы всё влезло в одно сообщение."""
+        channel, posts = section.channel, section.posts
+        header_probe = channel_header(channel, len(posts), "сжато, без мелочей")
+        footer_reserve = 120
+        budget = MESSAGE_LIMIT - visible_len(header_probe) - footer_reserve
+        # на каждую строку уходит ~12 символов на «▫️ 09:15 » и перевод строки
+        text_budget = max(400, int((budget - 12 * min(len(posts), 25)) * 0.85))
+
+        try:
+            keep = await self.processor.compress_channel(channel, posts, text_budget)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось сжать %s: %s", channel.ref, exc)
+            return None
+        if not keep:
+            return None
+
+        # keep — в порядке важности; гарантируем лимит, выкидывая наименее важное
+        by_id = {p.id: p for p in posts}
+        chosen: list[tuple[Post, str]] = [(by_id[i], t) for i, t in keep if i in by_id]
+        while chosen:
+            lines = [render_compact(p, t, self.cfg) for p, t in sorted(chosen, key=lambda x: x[0].posted_at)]
+            dropped = len(posts) - len(chosen)
+            note = "сжато, без мелочей" if dropped else "сжато"
+            header = channel_header(channel, len(posts), note)
+            body = "\n".join(lines)
+            footer = ""
+            if dropped:
+                footer = (
+                    f"\n\n<i>…и ещё {dropped} {plural(dropped, 'пост', 'поста', 'постов')} "
+                    f'поменьше — <a href="{esc_attr(channel.link)}">в канале</a></i>'
+                )
+            text = header + "\n\n" + body + footer
+            if visible_len(text) <= MESSAGE_LIMIT:
+                section.compressed = True
+                section.dropped = dropped
+                return [text]
+            chosen.pop()  # последний — наименее важный
+        return None
+
+    async def _build_section(self, section: Section, can_compress: bool) -> None:
+        parts = self._render_full(section)
+        if len(parts) > 1 and can_compress:
+            compressed = await self._compress(section)
+            if compressed:
+                section.parts = compressed
+                return
+        section.parts = parts
+
+    # ---------- сборка ----------
+
+    def _title(self, now: datetime) -> str:
+        local = now.astimezone(self.cfg.tz)
+        if len(self.cfg.digest_times) > 1:
+            return f"Дайджест · {human_date(local)}, {local.strftime('%H:%M')}"
+        return f"Дайджест за {human_date(local)}"
 
     async def build(self, tag: str | None = None, save: bool = True) -> Digest | None:
         await self.processor.process_pending(final=save)
@@ -201,27 +313,47 @@ class DigestBuilder:
                 await self.db.mark_digested([p.id for p in ads], 0)
             return None
 
-        local_now = now.astimezone(self.cfg.tz)
-        title = f"Дайджест за {human_date(local_now)}"
+        entries.sort(key=sort_key)
+        sections = [
+            Section(channel=items[0][1], posts=[p for p, _ in items])
+            for items in (list(g) for _, g in groupby(entries, key=lambda e: e[1].id))
+        ]
+
+        llm = self.processor.llm
+        can_compress = bool(llm) and not getattr(llm, "paused", False)
+        overview_task = None
+        if self.cfg.digest_overview:
+            overview_task = asyncio.create_task(self.processor.overview(entries))
+        await asyncio.gather(*(self._build_section(s, can_compress) for s in sections))
+        overview = await overview_task if overview_task else ""
+
+        title = self._title(now)
         if tag:
             title += f" · #{tag}"
         stats = {
             "posts": len(entries),
-            "channels": len({c.id for _, c in entries}),
+            "channels": len(sections),
             "ads": len(ads),
             "summarized": sum(1 for p, _ in entries if p.summarized),
+            "dropped": sum(s.dropped for s in sections),
         }
 
-        overview = ""
-        if self.cfg.digest_overview:
-            overview = await self.processor.overview(sorted(entries, key=_sort_key))
-
-        blocks = render_digest(entries, self.cfg, title, stats, overview)
+        header = f"📰 <b>{esc(title)}</b>\n"
+        header += f"Постов: {stats['posts']} · каналов: {stats['channels']}"
+        if stats["ads"]:
+            header += f" · пропущено рекламы: {stats['ads']}"
+        if overview:
+            heading = "Главное за день" if len(self.cfg.digest_times) == 1 else "Главное"
+            header += f"\n\n🧭 <b>{heading}</b>\n{esc(overview)}"
         if not entries:
-            blocks.append("\nНовых постов нет 🌿")
+            header += "\n\nНовых постов нет 🌿"
+        if visible_len(header) > MESSAGE_LIMIT:
+            header = split_blocks(header.split("\n"))[0]
+
         digest = Digest(
             title=title,
-            blocks=blocks,
+            header=header,
+            sections=sections,
             stats=stats,
             post_ids=[p.id for p, _ in entries] + [p.id for p in ads],
         )

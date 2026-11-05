@@ -59,11 +59,24 @@ SYSTEM_PROMPT = """Ты помогаешь составлять ежедневн
 Ответь ТОЛЬКО JSON без пояснений в формате:
 {{"posts": [{{"id": <id>, "is_ad": true|false, "summary": "..."}}]}}"""
 
-OVERVIEW_PROMPT = """Ты редактор утреннего дайджеста Telegram-каналов. Тебе дан список
-новостей за сутки (канал, теги, текст). Напиши блок «Главное за день»: 3–6 самых
+OVERVIEW_PROMPT = """Ты редактор дайджеста Telegram-каналов. Тебе дан список
+новостей за период (канал, теги, текст). Напиши блок «Главное за день»: 3–6 самых
 важных пунктов, каждый — одно короткое предложение. Объединяй повторяющиеся
 сюжеты из разных каналов. Язык: {language}. Ответь только списком пунктов, каждый
 с новой строки, начиная с «• ». Без заголовка и без Markdown-разметки."""
+
+
+COMPRESS_PROMPT = """Ты редактор дайджеста. Тебе даны посты одного Telegram-канала «{channel}».
+Они не помещаются в одно сообщение, поэтому:
+* выкинь несущественное: мелкие и проходные новости, повторы одного сюжета, анонсы,
+  опросы, поздравления, оффтоп, посты «только медиа» без важного смысла;
+* каждый оставшийся пост перескажи ОДНОЙ короткой фразой (не длиннее {line_chars} символов),
+  сразу суть, без вступлений;
+* суммарная длина всех фраз — не больше {budget} символов;
+* важные новости не выкидывай; похожие посты можно оставить одним (выбери один id).
+Язык: {language}.
+Ответь ТОЛЬКО JSON, посты в порядке убывания важности:
+{{"keep": [{{"id": <id>, "text": "..."}}]}}"""
 
 
 @dataclass
@@ -221,6 +234,53 @@ class Processor:
                     post.summarized = True
                 else:
                     self._fallback(post)
+
+    async def compress_channel(
+        self, channel: Channel, posts: list[Post], budget: int
+    ) -> list[tuple[int, str]]:
+        """Отбирает важные посты канала и сжимает их до одной фразы.
+
+        Возвращает [(post_id, text)] в порядке убывания важности.
+        """
+        if not self.llm:
+            return []
+        items = []
+        for post in posts:
+            if post.media_only:
+                body = f"[только медиа: {', '.join(post.media)}]"
+            else:
+                body = post.summary if post.summarized and post.summary else truncate(post.text, 700)
+            items.append({"id": post.id, "text": body})
+        line_chars = max(60, min(220, budget // max(1, min(len(posts), 20))))
+        system = COMPRESS_PROMPT.format(
+            channel=channel.display_name,
+            line_chars=line_chars,
+            budget=budget,
+            language=self.cfg.digest_language,
+        )
+        data = await self.llm.complete_json(
+            system,
+            json.dumps({"posts": items}, ensure_ascii=False),
+            max_tokens=min(4000, 200 + budget),
+        )
+        rows = data.get("keep", []) if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            raise LLMError("Ожидался список keep")
+        valid = {p.id for p in posts}
+        result: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                pid = int(row.get("id"))
+            except (TypeError, ValueError):
+                continue
+            text = str(row.get("text") or "").strip()
+            if pid in valid and pid not in seen and text:
+                seen.add(pid)
+                result.append((pid, truncate(text, line_chars + 40)))
+        return result
 
     async def overview(self, entries: list[tuple[Post, Channel]]) -> str:
         """Блок «Главное за день» по всем постам дайджеста."""

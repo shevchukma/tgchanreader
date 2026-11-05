@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import html
+import inspect
 import logging
+import re
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import BotCommand, Message, TelegramObject
 
@@ -21,36 +24,42 @@ from .sources import SourceError
 
 log = logging.getLogger(__name__)
 
-HELP = """<b>Бот-дайджест Telegram-каналов</b>
+HELP_USER = """<b>Бот-дайджест Telegram-каналов</b>
 
-Каждый день в {times} ({tz}) я присылаю сводку новых постов: длинные сокращаю,
-рекламу пропускаю, медиа-посты отмечаю ссылкой.
+В {times} ({tz}) я присылаю сводку новых постов из отслеживаемых каналов:
+каждый канал отдельным сообщением, длинные посты сокращены, реклама пропущена.
 
-<b>Каналы</b>
+/start — подписаться на дайджест
+/stop — отписаться
+/list — какие каналы отслеживаются
+/preview [тег] — что попадёт в следующий дайджест
+/status — статистика
+"""
+
+HELP_ADMIN = HELP_USER + """
+<b>Управление (только администраторы)</b>
 /add @канал [теги] [приоритет] — добавить канал
-   <code>/add @meduzalive политика,новости 1</code>
-   <code>/add https://t.me/velo_ru велосипед 3</code>
+   <code>/add @example_news новости,город 1</code>
+   <code>/add https://t.me/example_velo велосипед 3</code>
 /remove @канал — удалить
-/list — список каналов
-/tag @канал тег1,тег2 — задать теги (<code>-</code> — убрать)
+/tag @канал тег1,тег2 — задать теги (<code>-</code> — убрать), /tag — все теги
 /priority @канал 1 — задать приоритет (1 — самый важный)
 /pause @канал, /resume @канал — приостановить / возобновить
 /import — импортировать все подписки (только режим Telethon)
-
-Можно просто переслать мне пост из канала — я добавлю канал.
-
-<b>Дайджест</b>
-/digest — собрать и прислать дайджест прямо сейчас
-/preview [тег] — посмотреть, что попадёт в дайджест (без отметки прочитанным)
-/status — статистика
+/digest — собрать и разослать дайджест прямо сейчас
+/subscribers — кто получает дайджест
 /llmtest — проверить подключение к нейросети
 /reprocess — заново обработать нейросетью посты, ещё не попавшие в дайджест
+
+Можно просто переслать мне пост из канала — я добавлю канал.
 """
 
 
-class AdminMiddleware(BaseMiddleware):
-    def __init__(self, admin_ids: list[int]):
-        self.admin_ids = set(admin_ids)
+class AccessMiddleware(BaseMiddleware):
+    """Пускает только пользователей из ADMIN_IDS и ALLOWED_IDS."""
+
+    def __init__(self, cfg):  # type: ignore[no-untyped-def]
+        self.cfg = cfg
 
     async def __call__(
         self,
@@ -59,17 +68,38 @@ class AdminMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         user = data.get("event_from_user")
-        if user is None or user.id not in self.admin_ids:
-            if isinstance(event, Message):
-                if not self.admin_ids:
+        allowed = self.cfg.access_ids
+        if user is None or user.id not in allowed:
+            if isinstance(event, Message) and user is not None:
+                log.info("Отказано в доступе: id=%s @%s", user.id, user.username)
+                if not allowed:
                     await event.answer(
-                        f"Бот ещё не настроен. Ваш Telegram ID: <code>{user.id if user else '?'}</code>\n"
+                        f"Бот ещё не настроен. Ваш Telegram ID: <code>{user.id}</code>\n"
                         "Укажите его в переменной окружения <code>ADMIN_IDS</code> и перезапустите контейнер."
                     )
                 else:
-                    await event.answer("⛔ Это приватный бот.")
+                    await event.answer(
+                        "⛔ Это приватный бот.\n"
+                        f"Ваш Telegram ID: <code>{user.id}</code> — передайте его владельцу, "
+                        "если хотите получать дайджест."
+                    )
             return None
+        data["is_admin"] = user.id in self.cfg.admin_ids
         return await handler(event, data)
+
+
+def admin_only(fn):  # type: ignore[no-untyped-def]
+    """Декоратор: команда доступна только ADMIN_IDS."""
+    params = set(inspect.signature(fn).parameters)
+
+    async def wrapper(message: Message, **kwargs: Any) -> Any:
+        if not kwargs.get("is_admin"):
+            await message.answer("🔒 Эта команда доступна только администратору.")
+            return None
+        return await fn(message, **{k: v for k, v in kwargs.items() if k in params})
+
+    wrapper.__name__ = fn.__name__
+    return wrapper
 
 
 def channel_line(ch: Channel) -> str:
@@ -106,34 +136,76 @@ class TelegramBot:
         )
         self.dp = Dispatcher()
         router = Router()
-        router.message.middleware(AdminMiddleware(cfg.admin_ids))
+        router.message.middleware(AccessMiddleware(cfg))
         self._register(router)
         self.dp.include_router(router)
         service.senders.append(self.send_digest)
 
     # ---------- отправка ----------
 
-    async def _send(self, chat_id: int, text: str) -> None:
-        for attempt in range(5):
+    async def _send(self, chat_id: int, text: str, silent: bool = False) -> bool:
+        """Отправляет сообщение; False — если получатель недоступен (заблокировал бота)."""
+        for _ in range(5):
             try:
-                await self.bot.send_message(chat_id, text)
-                return
+                await self.bot.send_message(chat_id, text, disable_notification=silent)
+                return True
             except TelegramRetryAfter as exc:
                 await asyncio.sleep(exc.retry_after + 1)
+            except TelegramForbiddenError:
+                log.warning("Чат %s недоступен (бот заблокирован?) — отписываем", chat_id)
+                await self.service.db.unsubscribe(chat_id)
+                return False
+            except TelegramBadRequest as exc:
+                # например, сломанная разметка — отправим текстом без форматирования
+                log.error("Telegram отклонил сообщение в %s: %s", chat_id, exc)
+                plain = html.unescape(re.sub(r"<[^>]+>", "", text))[:4096]
+                try:
+                    await self.bot.send_message(
+                        chat_id, plain, parse_mode=None, disable_notification=silent
+                    )
+                    return True
+                except Exception:  # noqa: BLE001
+                    log.exception("Не удалось отправить и простым текстом")
+                    return True
         log.error("Не удалось отправить сообщение в %s", chat_id)
+        return True
 
     async def send_chunks(self, chat_id: int, chunks: list[str]) -> None:
-        for chunk in chunks:
-            await self._send(chat_id, chunk)
-            await asyncio.sleep(0.5)
+        """Первое сообщение — со звуком, остальные — без уведомления."""
+        for i, chunk in enumerate(chunks):
+            if not await self._send(chat_id, chunk, silent=i > 0):
+                return
+            await asyncio.sleep(0.4)
+
+    async def recipients(self) -> list[int]:
+        """Подписчики, которым разрешён доступ в .env, плюс DIGEST_CHAT_IDS."""
+        cfg = self.service.cfg
+        allowed = cfg.access_ids
+        result: list[int] = []
+        for sub in await self.service.db.list_subscribers():
+            if sub["user_id"] in allowed and sub["chat_id"] not in result:
+                result.append(sub["chat_id"])
+        for chat_id in cfg.digest_chat_ids:
+            if chat_id not in result:
+                result.append(chat_id)
+        return result
+
+    def digest_messages(self, digest: Digest) -> list[str]:
+        messages = digest.messages()
+        cfg = self.service.cfg
+        if digest.id and cfg.web_enabled:
+            link = f"{cfg.web_base_url}/digest/{digest.id}"
+            if cfg.web_token:
+                link += f"?token={cfg.web_token}"
+            messages[0] += f'\n\n🌐 <a href="{html.escape(link)}">Открыть в браузере</a>'
+        return messages
 
     async def send_digest(self, digest: Digest) -> None:
-        chunks = digest.chunks()
-        if digest.id and self.service.cfg.web_enabled:
-            base = self.service.cfg.web_base_url
-            chunks[-1] += f'\n\n🌐 <a href="{base}/digest/{digest.id}">Открыть в браузере</a>'
-        for chat_id in self.service.cfg.recipients:
-            await self.send_chunks(chat_id, chunks)
+        messages = self.digest_messages(digest)
+        recipients = await self.recipients()
+        log.info("Отправка дайджеста: %d сообщений × %d получателей", len(messages), len(recipients))
+        for chat_id in recipients:
+            await self.send_chunks(chat_id, messages)
 
     # ---------- команды ----------
 
@@ -141,13 +213,59 @@ class TelegramBot:
         svc = self.service
         cfg = svc.cfg
 
-        @r.message(CommandStart())
-        @r.message(Command("help"))
-        async def start(message: Message) -> None:
+        def help_text(is_admin: bool) -> str:
             times = ", ".join(t.strftime("%H:%M") for t in cfg.digest_times)
-            await message.answer(HELP.format(times=times, tz=cfg.timezone))
+            return (HELP_ADMIN if is_admin else HELP_USER).format(times=times, tz=cfg.timezone)
+
+        @r.message(CommandStart())
+        async def start(message: Message, is_admin: bool) -> None:
+            user = message.from_user
+            assert user
+            name = user.full_name + (f" (@{user.username})" if user.username else "")
+            new = await svc.db.subscribe(user.id, message.chat.id, name)
+            if new:
+                log.info("Новый подписчик: %s id=%s", name, user.id)
+                head = "✅ Вы подписаны на дайджест."
+            else:
+                head = "Вы уже подписаны на дайджест."
+            await message.answer(f"{head}\n\n{help_text(is_admin)}")
+
+        @r.message(Command("help"))
+        async def help_cmd(message: Message, is_admin: bool) -> None:
+            await message.answer(help_text(is_admin))
+
+        @r.message(Command("stop", "unsubscribe"))
+        async def stop(message: Message) -> None:
+            assert message.from_user
+            await svc.db.unsubscribe(message.from_user.id)
+            await message.answer("🔕 Вы отписались от дайджеста. Подписаться снова: /start")
+
+        @r.message(Command("subscribers", "users"))
+        @admin_only
+        async def subscribers(message: Message) -> None:
+            subs = {s["user_id"]: s for s in await svc.db.list_subscribers(active_only=False)}
+            lines = ["<b>Получатели дайджеста</b>"]
+            for uid in sorted(cfg.access_ids):
+                sub = subs.get(uid)
+                role = "админ" if uid in cfg.admin_ids else "друг"
+                name = esc(sub["name"]) if sub and sub["name"] else f"<code>{uid}</code>"
+                if sub and sub["active"]:
+                    state = "✅ подписан"
+                elif sub:
+                    state = "🔕 отписался"
+                else:
+                    state = "⏳ ещё не нажал /start"
+                lines.append(f"• {name} — {role}, {state}")
+            others = [s for uid, s in subs.items() if uid not in cfg.access_ids and s["active"]]
+            if others:
+                lines.append(f"\nНе получают (нет в .env): {len(others)}")
+            for chat_id in cfg.digest_chat_ids:
+                lines.append(f"• чат <code>{chat_id}</code> (DIGEST_CHAT_IDS)")
+            lines.append("\nДобавить друга: его ID в <code>ALLOWED_IDS</code> в .env и перезапуск.")
+            await message.answer("\n".join(lines))
 
         @r.message(Command("add"))
+        @admin_only
         async def add(message: Message, command: CommandObject) -> None:
             try:
                 ref, tags, priority = parse_add_args(command.args or "")
@@ -161,6 +279,7 @@ class TelegramBot:
             )
 
         @r.message(Command("remove", "del", "delete"))
+        @admin_only
         async def remove(message: Message, command: CommandObject) -> None:
             channel = await svc.find_channel(command.args or "")
             if not channel:
@@ -185,6 +304,7 @@ class TelegramBot:
             await self.send_chunks(message.chat.id, split_blocks(blocks))
 
         @r.message(Command("tag", "tags"))
+        @admin_only
         async def tag(message: Message, command: CommandObject) -> None:
             parts = (command.args or "").split(maxsplit=1)
             if not parts:
@@ -210,6 +330,7 @@ class TelegramBot:
             await message.answer(f"🏷 {channel_line(channel)}")
 
         @r.message(Command("priority", "prio"))
+        @admin_only
         async def priority(message: Message, command: CommandObject) -> None:
             parts = (command.args or "").split()
             if len(parts) != 2 or not parts[1].isdigit():
@@ -233,14 +354,17 @@ class TelegramBot:
             )
 
         @r.message(Command("pause"))
+        @admin_only
         async def pause(message: Message, command: CommandObject) -> None:
             await _set_active(message, command, False)
 
         @r.message(Command("resume"))
+        @admin_only
         async def resume(message: Message, command: CommandObject) -> None:
             await _set_active(message, command, True)
 
         @r.message(Command("import"))
+        @admin_only
         async def import_subs(message: Message) -> None:
             source = svc.source
             primary = getattr(source, "primary", None)
@@ -263,13 +387,14 @@ class TelegramBot:
             )
 
         @r.message(Command("digest", "now"))
+        @admin_only
         async def digest_now(message: Message) -> None:
             await message.answer("⏳ Собираю дайджест…")
             digest = await svc.make_and_send_digest()
             if digest is None:
                 await message.answer("Новых постов нет 🌿")
-            elif message.chat.id not in cfg.recipients:
-                await self.send_chunks(message.chat.id, digest.chunks())
+            elif message.chat.id not in await self.recipients():
+                await self.send_chunks(message.chat.id, self.digest_messages(digest))
 
         @r.message(Command("preview"))
         async def preview(message: Message, command: CommandObject) -> None:
@@ -280,7 +405,7 @@ class TelegramBot:
             if digest is None:
                 await message.answer("Пока нечего показать 🌿")
                 return
-            await self.send_chunks(message.chat.id, digest.chunks())
+            await self.send_chunks(message.chat.id, digest.messages())
 
         @r.message(Command("status"))
         async def status(message: Message) -> None:
@@ -300,6 +425,7 @@ class TelegramBot:
             )
 
         @r.message(Command("llmtest"))
+        @admin_only
         async def llmtest(message: Message) -> None:
             if not svc.llm:
                 await message.answer("LLM выключен (LLM_PROVIDER=none или не задан LLM_API_KEY).")
@@ -321,6 +447,7 @@ class TelegramBot:
             )
 
         @r.message(Command("reprocess"))
+        @admin_only
         async def reprocess(message: Message) -> None:
             if not svc.llm:
                 await message.answer("LLM выключен — переобрабатывать нечем.")
@@ -341,6 +468,7 @@ class TelegramBot:
             await message.answer(text)
 
         @r.message(F.forward_origin)
+        @admin_only
         async def forwarded(message: Message) -> None:
             origin = message.forward_origin
             chat = getattr(origin, "chat", None)
@@ -362,8 +490,13 @@ class TelegramBot:
                 await message.answer(f"Канал уже отслеживается: {channel_line(channel)}")
 
     async def run(self) -> None:
+        # админы получают дайджест без /start (если сами не отписались)
+        for admin_id in self.service.cfg.admin_ids:
+            await self.service.db.ensure_subscriber(admin_id)
         await self.bot.set_my_commands(
             [
+                BotCommand(command="start", description="Подписаться на дайджест"),
+                BotCommand(command="stop", description="Отписаться"),
                 BotCommand(command="digest", description="Дайджест сейчас"),
                 BotCommand(command="preview", description="Предпросмотр дайджеста"),
                 BotCommand(command="list", description="Список каналов"),
@@ -372,6 +505,7 @@ class TelegramBot:
                 BotCommand(command="tag", description="Теги канала"),
                 BotCommand(command="priority", description="Приоритет канала"),
                 BotCommand(command="status", description="Статус"),
+                BotCommand(command="subscribers", description="Получатели дайджеста"),
                 BotCommand(command="llmtest", description="Проверить нейросеть"),
                 BotCommand(command="reprocess", description="Переобработать посты нейросетью"),
                 BotCommand(command="help", description="Помощь"),

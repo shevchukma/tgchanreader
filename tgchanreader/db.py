@@ -50,6 +50,14 @@ CREATE TABLE IF NOT EXISTS digests (
     stats TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE TABLE IF NOT EXISTS subscribers (
+    user_id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -329,6 +337,47 @@ class Database:
             "html": row["html"],
             "stats": json.loads(row["stats"] or "{}"),
         }
+
+    # ---------- subscribers ----------
+
+    async def subscribe(self, user_id: int, chat_id: int, name: str = "") -> bool:
+        """Подписывает пользователя; возвращает True, если он не был активен."""
+        async with self.conn.execute(
+            "SELECT active FROM subscribers WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        await self.conn.execute(
+            "INSERT INTO subscribers(user_id, chat_id, name, active, created_at) VALUES (?,?,?,1,?)"
+            " ON CONFLICT(user_id) DO UPDATE SET chat_id = excluded.chat_id,"
+            " name = CASE WHEN excluded.name != '' THEN excluded.name ELSE subscribers.name END,"
+            " active = 1",
+            (user_id, chat_id, name, _now()),
+        )
+        await self.conn.commit()
+        return not (row and row[0])
+
+    async def ensure_subscriber(self, user_id: int) -> None:
+        """Добавляет подписчика, если его ещё нет (не трогает тех, кто отписался)."""
+        await self.conn.execute(
+            "INSERT OR IGNORE INTO subscribers(user_id, chat_id, active, created_at) VALUES (?,?,1,?)",
+            (user_id, user_id, _now()),
+        )
+        await self.conn.commit()
+
+    async def unsubscribe(self, user_id: int) -> None:
+        await self.conn.execute("UPDATE subscribers SET active = 0 WHERE user_id = ?", (user_id,))
+        await self.conn.commit()
+
+    async def list_subscribers(self, active_only: bool = True) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM subscribers"
+        if active_only:
+            sql += " WHERE active = 1"
+        async with self.conn.execute(sql + " ORDER BY created_at") as cur:
+            rows = await cur.fetchall()
+        return [
+            {"user_id": r["user_id"], "chat_id": r["chat_id"], "name": r["name"], "active": bool(r["active"])}
+            for r in rows
+        ]
 
     # ---------- settings ----------
 

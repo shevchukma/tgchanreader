@@ -1,6 +1,6 @@
 from datetime import timedelta
 
-from tgchanreader.digest import split_blocks
+from tgchanreader.digest import split_blocks, visible_len
 from tgchanreader.models import RawPost
 from tgchanreader.service import Service
 
@@ -40,11 +40,15 @@ async def test_full_flow(cfg):
 
         digest = await svc.builder.build()
         assert digest is not None
-        assert digest.stats == {"posts": 4, "channels": 2, "ads": 2, "summarized": 1}
+        assert digest.stats == {"posts": 4, "channels": 2, "ads": 2, "summarized": 1, "dropped": 0}
 
         text = digest.html
-        # порядок приоритетов
-        assert text.index("ПРИОРИТЕТ 1") < text.index("ПРИОРИТЕТ 3")
+        # шапка + по сообщению на канал, по порядку приоритетов
+        messages = digest.messages()
+        assert len(messages) == 3
+        assert "Дайджест" in messages[0] and "Главное за день" in messages[0]
+        assert messages[1].startswith("🔴") and "Title politics_ch" in messages[1].split("\n")[0]
+        assert messages[2].startswith("🟡") and "Title velo_ch" in messages[2].split("\n")[0]
         assert "Краткое содержание." in text and "читать полностью" in text
         assert 'href="https://t.me/politics_ch/1"' in text
         assert "Короткая новость" in text
@@ -99,7 +103,8 @@ async def test_tag_filter(cfg):
 def test_split_blocks():
     blocks = [f"<b>block {i}</b> " + "x" * 300 for i in range(40)]
     chunks = split_blocks(blocks, 1000)
-    assert all(len(c) <= 1000 for c in chunks)
+    assert len(chunks) > 1
+    assert all(visible_len(c) <= 1000 for c in chunks)
     assert "".join(chunks).count("<b>") == 40
     assert all(c.count("<b>") == c.count("</b>") for c in chunks)
 

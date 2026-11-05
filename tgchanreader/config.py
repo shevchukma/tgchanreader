@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import time
 from zoneinfo import ZoneInfo
@@ -52,15 +53,39 @@ def _int_list(name: str) -> list[int]:
     return result
 
 
+_RANGE_RE = re.compile(
+    r"^(\d{1,2})(?::(\d{2}))?\s*-\s*(\d{1,2})(?::(\d{2}))?\s*/\s*(\d+)\s*(h|ч|m|мин)?$", re.I
+)
+
+
 def parse_times(raw: str) -> list[time]:
-    """'08:00, 19:30' -> [time(8, 0), time(19, 30)]"""
+    """Разбирает расписание.
+
+    '08:00, 19:30'      -> 08:00, 19:30
+    '06:00-21:00/3'     -> 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 (шаг в часах)
+    '09:00-10:00/30m'   -> 09:00, 09:30, 10:00 (шаг в минутах)
+    """
     times: list[time] = []
     for part in raw.replace(";", ",").split(","):
         part = part.strip()
         if not part:
             continue
+        m = _RANGE_RE.match(part)
+        if m:
+            start = int(m.group(1)) * 60 + int(m.group(2) or 0)
+            end = int(m.group(3)) * 60 + int(m.group(4) or 0)
+            unit = (m.group(6) or "h").lower()
+            step = int(m.group(5)) * (1 if unit in {"m", "мин"} else 60)
+            if step <= 0 or end < start:
+                raise ValueError(f"Неверный интервал в расписании: {part!r}")
+            for minute in range(start, end + 1, step):
+                times.append(time(minute // 60 % 24, minute % 60))
+            continue
         hh, _, mm = part.partition(":")
-        times.append(time(int(hh), int(mm or 0)))
+        try:
+            times.append(time(int(hh), int(mm or 0)))
+        except ValueError as exc:
+            raise ValueError(f"Неверное время в DIGEST_TIMES: {part!r}") from exc
     return sorted(set(times))
 
 
@@ -105,7 +130,8 @@ class LLMConfig:
 class Config:
     # Telegram-бот (управление + отправка дайджеста)
     bot_token: str = ""
-    admin_ids: list[int] = field(default_factory=list)
+    admin_ids: list[int] = field(default_factory=list)  # полное управление
+    allowed_ids: list[int] = field(default_factory=list)  # друзья: получают дайджест, без управления
     digest_chat_ids: list[int] = field(default_factory=list)
 
     # Источник постов
@@ -164,8 +190,9 @@ class Config:
         return self.source
 
     @property
-    def recipients(self) -> list[int]:
-        return self.digest_chat_ids or self.admin_ids
+    def access_ids(self) -> set[int]:
+        """Все, кому разрешено пользоваться ботом."""
+        return set(self.admin_ids) | set(self.allowed_ids)
 
 
 def load_config() -> Config:
@@ -192,6 +219,7 @@ def load_config() -> Config:
     cfg = Config(
         bot_token=_env("BOT_TOKEN"),
         admin_ids=_int_list("ADMIN_IDS"),
+        allowed_ids=_int_list("ALLOWED_IDS"),
         digest_chat_ids=_int_list("DIGEST_CHAT_IDS"),
         source=_env("SOURCE", "auto").lower(),
         tg_api_id=_int("TG_API_ID", 0),
