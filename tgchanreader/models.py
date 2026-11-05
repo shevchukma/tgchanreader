@@ -86,74 +86,28 @@ class Post:
         return not self.text.strip() and bool(self.media)
 
 
-_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
-_INVITE_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
-# пути t.me, которые не являются каналами
-_RESERVED = {
-    "share", "addstickers", "addemoji", "addtheme", "addlist", "proxy", "socks", "iv",
-    "login", "setlanguage", "confirmphone", "invoice", "bg", "m", "contact", "giftcode",
-}
-_TG_HOSTS = r"(?:t\.me|telegram\.me|telegram\.dog)"
-
-# ссылки и @упоминания каналов внутри произвольного текста
-LINK_RE = re.compile(
-    rf"(?:https?://)?(?:www\.)?(?:[A-Za-z0-9_]+\.)?{_TG_HOSTS}/[^\s<>\"'«»()]+"
-    rf"|(?:https?://)?[A-Za-z][A-Za-z0-9_]{{3,31}}\.{_TG_HOSTS}\b"
-    r"|tg://resolve\?[^\s<>\"']+"
-    r"|(?<![\w@])@[A-Za-z][A-Za-z0-9_]{3,31}\b",
-    re.I,
-)
-
-
-def is_invite(ref: str) -> bool:
-    """normalize_ref() возвращает '+hash' для ссылок-приглашений."""
-    return ref.startswith("+")
+_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,}$")
 
 
 def normalize_ref(raw: str) -> str | None:
-    """Приводит к ref любой вид ссылки на канал.
-
-    @name · name · t.me/name · https://t.me/s/name · t.me/name/123 · name.t.me ·
-    tg://resolve?domain=name · t.me/c/123456/78 и -100123456 (приватный канал по id) →
-    'name' или '-100123456'; t.me/+hash и t.me/joinchat/hash (приглашение) → '+hash'.
-    """
-    value = raw.strip().strip("<>()[]{}\"'«»").rstrip(".,;:!?…")
+    """Приводит @name / t.me/name / https://t.me/s/name / -100123 к ref."""
+    value = raw.strip()
     if not value:
         return None
-
-    m = re.match(r"^tg://resolve\?(.*)$", value, re.I)
-    if m:
-        params = dict(p.partition("=")[::2] for p in m.group(1).split("&"))
-        value = params.get("domain", "")
-    m = re.match(r"^tg://join\?invite=([A-Za-z0-9_-]+)", value, re.I)
-    if m:
-        return f"+{m.group(1)}"
-
-    # name.t.me
-    m = re.match(rf"^(?:https?://)?([A-Za-z][A-Za-z0-9_]{{3,31}})\.{_TG_HOSTS}/?$", value, re.I)
-    if m and m.group(1).lower() != "www":
-        value = m.group(1)
-
-    value = re.sub(rf"^(?:https?://)?(?:www\.)?{_TG_HOSTS}/", "", value, flags=re.I)
-    value = value.split("?")[0].split("#")[0].strip("/")
-    parts = [p for p in value.split("/") if p]
-    if not parts:
-        return None
-    first = parts[0]
-
-    if first.startswith("+"):
-        return f"+{first[1:]}" if _INVITE_RE.match(first[1:]) else None
-    if first.lower() == "joinchat":
-        return f"+{parts[1]}" if len(parts) > 1 and _INVITE_RE.match(parts[1]) else None
-    if first.lower() == "c":
-        # t.me/c/123456/789 -> приватный канал
-        return f"-100{parts[1]}" if len(parts) > 1 and parts[1].isdigit() else None
-    if first.lower() in {"s", "boost"} and len(parts) > 1:
-        first = parts[1]
-    if first.lower() in _RESERVED:
-        return None
-
-    value = first.lstrip("@")
+    value = re.sub(r"^(https?://)?(www\.)?(t\.me|telegram\.me|telegram\.dog)/", "", value)
+    if value.startswith("s/"):
+        value = value[2:]
+    value = value.split("?")[0].strip("/")
+    if "/" in value:
+        first, *_ = value.split("/")
+        if first == "c":
+            # t.me/c/123456/789 -> приватный канал
+            parts = value.split("/")
+            if len(parts) > 1 and parts[1].isdigit():
+                return f"-100{parts[1]}"
+            return None
+        value = first
+    value = value.lstrip("@")
     if value.lstrip("-").isdigit():
         if not value.startswith("-"):
             value = f"-100{value}"
@@ -161,16 +115,6 @@ def normalize_ref(raw: str) -> str | None:
     if _USERNAME_RE.match(value):
         return value.lower()
     return None
-
-
-def find_refs(text: str) -> list[str]:
-    """Все каналы, упомянутые в тексте ссылками или @именами (без повторов)."""
-    refs: list[str] = []
-    for m in LINK_RE.finditer(text or ""):
-        ref = normalize_ref(m.group(0))
-        if ref and ref not in refs:
-            refs.append(ref)
-    return refs
 
 
 def parse_tags(raw: str) -> list[str]:

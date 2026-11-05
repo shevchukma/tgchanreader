@@ -50,7 +50,7 @@ async def make_bot(cfg):
 _uid = 0
 
 
-async def send(bot: TelegramBot, user_id: int, text: str, entities=None) -> None:
+async def send(bot: TelegramBot, user_id: int, text: str) -> None:
     global _uid
     _uid += 1
     msg = Message(
@@ -59,8 +59,8 @@ async def send(bot: TelegramBot, user_id: int, text: str, entities=None) -> None
         chat=Chat(id=user_id, type="private"),
         from_user=User(id=user_id, is_bot=False, first_name=f"U{user_id}"),
         text=text,
-        entities=([{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
-                  if text.startswith("/") else []) + (entities or []) or None,
+        entities=[{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
+        if text.startswith("/") else None,
     )
     await bot.dp.feed_update(bot.bot, Update(update_id=_uid, message=msg))
 
@@ -183,41 +183,5 @@ async def test_digest_messages_silent_after_header(cfg):
         assert "Дайджест" in sent[0].text and not sent[0].disable_notification
         assert "Title aaaa_ch" in sent[1].text and sent[1].disable_notification
         assert "Title bbbb_ch" in sent[2].text
-    finally:
-        await svc.close()
-
-
-async def test_add_by_links(cfg):
-    svc, bot, session = await make_bot(cfg)
-    try:
-        await send(bot, FRIEND, "/add https://t.me/s/link_chan/123?single вело 2")
-        assert "Добавлен" in last_text(session, FRIEND)
-        ch = await svc.db.user_channel(FRIEND, "link_chan")
-        assert ch.tags == ["вело"] and ch.priority == 2
-
-        # ссылка спрятана под текстом
-        text = "/add мой канал"
-        await send(bot, FRIEND, text, [{"type": "text_link", "offset": 5, "length": 9,
-                                        "url": "https://t.me/hidden_chan"}])
-        assert "Добавлен" in last_text(session, FRIEND)
-        assert await svc.db.user_channel(FRIEND, "hidden_chan")
-
-        # просто список ссылок без команды
-        await send(bot, FRIEND, "вот: https://t.me/plain_one, @plain_two и t.me/link_chan")
-        text = last_text(session, FRIEND)
-        assert text.count("✅ Добавлен") == 2 and "Уже есть" in text
-
-        # приглашение в приватный канал без Telethon — понятная ошибка
-        await send(bot, FRIEND, "/add https://t.me/+AbCdEf12345")
-        assert "только в режиме Telethon" in last_text(session, FRIEND)
-
-        await send(bot, FRIEND, "/add https://t.me/share/url?url=x")
-        assert "Не понимаю" in last_text(session, FRIEND)
-
-        await send(bot, FRIEND, "привет")
-        assert "пришлите ссылку" in last_text(session, FRIEND)
-
-        await send(bot, FRIEND, "/remove https://t.me/plain_one/77")
-        assert "Удалён" in last_text(session, FRIEND)
     finally:
         await svc.close()

@@ -27,7 +27,7 @@ from aiogram.types import (
 from .config import DIGEST_SLOTS
 from .digest import Digest, esc, split_blocks
 from .llm import LLMError
-from .models import Channel, find_refs, normalize_ref, parse_tags
+from .models import Channel, parse_tags
 from .service import Service
 from .sources import SourceError
 
@@ -42,13 +42,12 @@ HELP_USER = """<b>Бот-дайджест Telegram-каналов</b>
 /add @канал [теги] [приоритет] — добавить канал
    <code>/add @example_news новости,город 1</code>
    <code>/add https://t.me/example_velo велосипед 3</code>
-   подойдёт ссылка на канал, на любой его пост или приглашение t.me/+…
 /remove @канал — удалить
 /list — мои каналы
 /tag @канал тег1,тег2 — задать теги (<code>-</code> — убрать), /tag — все мои теги
 /priority @канал 1 — задать приоритет (1 — самый важный)
 /pause @канал, /resume @канал — приостановить / возобновить
-Можно просто прислать ссылку на канал (или сразу несколько) или переслать пост из канала — я добавлю.
+Можно просто переслать мне пост из канала — я его добавлю.
 
 <b>Дайджест</b>
 /digest — прислать дайджест прямо сейчас
@@ -159,18 +158,6 @@ def schedule_text(hours: list[int], tz: str) -> str:
         "Нажимайте на время, чтобы включить или выключить его. Не чаще раза в 3 часа, "
         "минимум раз в сутки.\nТекстом: <code>/schedule 9,21</code>"
     )
-
-
-def entity_links(message: Message) -> list[str]:
-    """Ссылки из разметки сообщения: и видимые, и спрятанные под текстом."""
-    text = message.text or message.caption or ""
-    links: list[str] = []
-    for ent in message.entities or message.caption_entities or []:
-        if ent.type == "text_link" and ent.url:
-            links.append(ent.url)
-        elif ent.type in {"url", "mention"}:
-            links.append(ent.extract_from(text))
-    return links
 
 
 def parse_add_args(args: str) -> tuple[str, list[str] | None, int | None]:
@@ -341,11 +328,6 @@ class TelegramBot:
         async def add(message: Message, command: CommandObject, uid: int) -> None:
             try:
                 ref, tags, priority = parse_add_args(command.args or "")
-                if not normalize_ref(ref):
-                    # ссылка спрятана под текстом: «/add канал про вело» с гиперссылкой
-                    hidden = [link for link in entity_links(message) if normalize_ref(link)]
-                    if hidden:
-                        ref = hidden[0]
                 channel, created = await svc.add_channel(uid, ref, tags, priority)
             except (ValueError, SourceError) as exc:
                 await message.answer(f"⚠️ {esc(str(exc))}")
@@ -611,32 +593,6 @@ class TelegramBot:
                 )
             else:
                 await message.answer(f"Канал уже в вашем списке: {channel_line(channel)}")
-
-        # просто ссылка(и) на канал без команды — добавляем
-        @r.message(F.text & ~F.text.startswith("/"))
-        async def plain_links(message: Message, uid: int) -> None:
-            raw = message.text or ""
-            refs = find_refs(" ".join([raw, *entity_links(message)]))
-            if not refs:
-                await message.answer(
-                    "Чтобы добавить канал, пришлите ссылку на него (t.me/имя_канала), @имя_канала "
-                    "или перешлите пост из канала. Все команды: /help"
-                )
-                return
-            lines = []
-            for ref in refs[:20]:
-                label = f"t.me/{ref}" if not ref.startswith(("+", "-")) else ref
-                try:
-                    channel, created = await svc.add_channel(uid, ref)
-                except (ValueError, SourceError) as exc:
-                    lines.append(f"⚠️ {esc(label)}: {esc(str(exc).splitlines()[0])}")
-                    continue
-                lines.append(("✅ Добавлен: " if created else "Уже есть: ") + channel_line(channel))
-            if len(refs) > 20:
-                lines.append(f"…и ещё {len(refs) - 20}: присылайте не больше 20 ссылок за раз")
-            if any(line.startswith("✅") for line in lines):
-                lines.append("\nТеги и приоритет: <code>/tag @канал тег</code>, <code>/priority @канал 1</code>")
-            await message.answer("\n".join(lines))
 
     async def run(self) -> None:
         await self.bot.set_my_commands(
