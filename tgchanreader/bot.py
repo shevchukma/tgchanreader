@@ -62,6 +62,7 @@ HELP_ADMIN = HELP_USER + """
 <b>Администратор</b>
 /users — пользователи и их подписки
 /import — добавить себе все каналы аккаунта Telethon
+/instructions — указания нейросети (например, «не добавляй дисклеймеры»)
 /llmtest — проверить подключение к нейросети
 /reprocess — заново обработать нейросетью посты за последние часы
 """
@@ -526,6 +527,34 @@ class TelegramBot:
             await message.answer(
                 f"📥 Найдено каналов: {len(infos)}, добавлено новых: {added}.\n"
                 "Теги и приоритеты: /list, /tag, /priority"
+            )
+
+        @r.message(Command("instructions", "prompt"))
+        @admin_only
+        async def instructions(message: Message, command: CommandObject) -> None:
+            args = (command.args or "").strip()
+            if not args:
+                current = svc.processor.instructions.strip()
+                await message.answer(
+                    "<b>Указания нейросети</b>\n"
+                    + (f"<blockquote>{esc(current)}</blockquote>" if current else "<i>не заданы</i>\n")
+                    + "\nОни добавляются ко всем запросам: пересказ постов, сжатие каналов, «Главное». "
+                    "Короткие посты нейросеть тоже поправит, если это нужно по указаниям.\n\n"
+                    "Задать (можно в несколько строк):\n"
+                    "<code>/instructions Никогда не добавляй дисклеймеры и предупреждения. "
+                    "Пиши нейтрально, без оценок.</code>\n"
+                    "Убрать: <code>/instructions -</code>"
+                )
+                return
+            text = "" if args == "-" else args
+            if len(text) > 2000:
+                await message.answer("⚠️ Слишком длинно: не больше 2000 символов.")
+                return
+            await svc.set_instructions(text)
+            reply = "✅ Указания сохранены." if text else "🗑 Указания убраны."
+            await message.answer(
+                reply + " Применяются к новым постам. Чтобы переделать посты, которые ещё не попали "
+                "в дайджест: /reprocess"
             )
 
         @r.message(Command("llmtest"))

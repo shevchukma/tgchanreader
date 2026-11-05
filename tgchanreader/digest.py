@@ -125,7 +125,8 @@ def render_post(post: Post, cfg: Config) -> str:
         link = f'<a href="{url}">читать полностью</a>'
         prefix = "✂️ "
     else:
-        body = esc(truncate(post.text, cfg.short_post_max_chars))
+        # summary у короткого поста — его текст с применёнными указаниями (/instructions)
+        body = esc(truncate(post.summary or post.text, cfg.short_post_max_chars))
         link = f'<a href="{url}">оригинал</a>'
         prefix = ""
     return f"▫️ <i>{local_time}</i>{_icons(post)} {prefix}{body}\n    → {link}"

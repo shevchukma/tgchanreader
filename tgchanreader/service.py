@@ -17,7 +17,7 @@ from .db import Database
 from .digest import Digest, DigestBuilder
 from .llm import LLMClient, build_llm
 from .models import Channel, normalize_ref, parse_tags
-from .processor import Processor
+from .processor import Processor, strip_disclaimers
 from .sources import Source, SourceError, build_source
 
 log = logging.getLogger(__name__)
@@ -55,6 +55,9 @@ class Service:
         await self.source.start()
         for admin_id in self.cfg.admin_ids or [self.owner_id]:
             await self.db.ensure_user(admin_id)
+        saved = await self.db.get_setting("llm_instructions", "")
+        if saved:
+            self.processor.instructions = "" if saved == "-" else saved
         migrated = await self.db.migrate_shared_channels(self.owner_id)
         if migrated:
             log.info("Общий список каналов (%d) перенесён пользователю %s", migrated, self.owner_id)
@@ -171,6 +174,12 @@ class Service:
         log.info("Синхронизировано каналов из %s: %d", path, count)
         return count
 
+    async def set_instructions(self, text: str) -> None:
+        """Указания нейросети. Пустая строка — без указаний (перекрывает LLM_INSTRUCTIONS)."""
+        text = text.strip()
+        await self.db.set_setting("llm_instructions", text or "-")
+        self.processor.instructions = text
+
     # ---------- сбор (общий для всех пользователей) ----------
 
     async def _collect_one(self, channel: Channel, now: datetime) -> int:
@@ -185,6 +194,10 @@ class Service:
         except SourceError as exc:
             log.warning("Не удалось прочитать %s: %s", channel.ref, exc)
             return 0
+        if self.cfg.strip_disclaimers:
+            for post in posts:
+                post.text = strip_disclaimers(post.text)
+            posts = [p for p in posts if p.text or p.media]
         added = await self.db.add_posts(channel, posts)
         if added:
             log.info("%s: новых постов %d", channel.ref, added)

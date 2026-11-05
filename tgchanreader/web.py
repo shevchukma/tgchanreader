@@ -204,7 +204,7 @@ def build_app(service: Service) -> web.Application:
             if post.media_only:
                 text = f"Только медиа ({media_label(post.media)})"
             else:
-                text = post.summary if post.summarized and post.summary else post.text
+                text = post.summary or post.text
             first_line = text.strip().split("\n")[0]
             title = f"{channel.display_name}: {first_line[:90]}{'…' if len(first_line) > 90 else ''}"
             desc = esc(text).replace("\n", "<br>\n")

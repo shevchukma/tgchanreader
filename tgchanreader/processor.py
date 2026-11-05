@@ -30,6 +30,46 @@ def heuristic_is_ad(text: str) -> bool:
     return any(p.search(text) for p in AD_PATTERNS)
 
 
+# Обязательная плашка «иностранного агента» (стандартный текст по закону РФ).
+_FA_WORDS = re.compile(r"иностранн\w*\s+агент", re.I)
+_FA_OPENING = re.compile(
+    r"^\W*(данн\w+|настоящ\w+|это\w*)\s+(сообщени\w*|материал\w*|информаци\w*)", re.I
+)
+# та же плашка капсом (в том числе внутри строки с обычным текстом) — до точки и «18+»
+_CAPS = r"[А-ЯЁA-Z0-9()«»\"',:;\-–— ]"
+_FA_CAPS = re.compile(
+    rf"(?:ДАНН[А-ЯЁ]+|НАСТОЯЩ[А-ЯЁ]+|ЭТО[А-ЯЁ]*)\s+(?:СООБЩЕНИ|МАТЕРИАЛ|ИНФОРМАЦИ)[А-ЯЁ]*"
+    rf"{_CAPS}*?ИНОСТРАНН[А-ЯЁ]*\s+АГЕНТ{_CAPS}*\.?(?:\s*18\+)?"
+)
+
+
+def strip_disclaimers(text: str) -> str:
+    """Убирает плашку «иноагента» и одинокое «18+» после неё."""
+    if not text or not _FA_WORDS.search(text):
+        return text
+    lines = []
+    removed = False
+    for line in text.split("\n"):
+        # строка начинается с плашки, написанной обычным регистром
+        if _FA_WORDS.search(line) and len(line) < 700 and _FA_OPENING.match(line):
+            removed = True
+            continue
+        cleaned = re.sub(r"\s{2,}", " ", _FA_CAPS.sub("", line)) if _FA_CAPS.search(line) else line
+        if cleaned != line:
+            removed = True
+            if not cleaned.strip():
+                continue
+        lines.append(cleaned.rstrip())
+    if removed:
+        # «18+», оставшееся отдельной строкой после плашки
+        while lines and lines[-1].strip() in {"", "18+"}:
+            lines.pop()
+        while lines and lines[0].strip() in {"", "18+"}:
+            lines.pop(0)
+    result = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
 def truncate(text: str, limit: int) -> str:
     text = text.strip()
     if len(text) <= limit:
@@ -55,9 +95,20 @@ SYSTEM_PROMPT = """Ты помогаешь составлять ежедневн
    * Если у поста стоит "need_summary": true — сократи до 1–3 предложений
      (не длиннее {max_chars} символов), сохранив главные факты, цифры и выводы.
    * Если "need_summary": false — верни пустую строку "".
-   * Без вступлений вроде «В посте говорится», сразу суть.
+   * Без вступлений вроде «В посте говорится», сразу суть.{clean_rule}
 Ответь ТОЛЬКО JSON без пояснений в формате:
-{{"posts": [{{"id": <id>, "is_ad": true|false, "summary": "..."}}]}}"""
+{{"posts": [{{"id": <id>, "is_ad": true|false, "summary": "..."{clean_field}}}]}}"""
+
+CLEAN_RULE = """
+3. clean — только для постов с "need_summary": false: если к тексту нужно применить указания
+   владельца (ниже), верни исправленный полный текст поста; если править нечего — пустую строку "".
+   Ничего не пересказывай и не сокращай, только применяй указания."""
+
+INSTRUCTIONS_BLOCK = """
+
+Указания владельца дайджеста — соблюдай их всегда, они важнее правил выше
+(кроме формата ответа):
+{instructions}"""
 
 OVERVIEW_PROMPT = """Ты редактор дайджеста Telegram-каналов. Тебе дан список
 новостей за период (канал, теги, текст). Напиши блок «Главное за день»: 3–6 самых
@@ -95,6 +146,13 @@ class Processor:
         self.llm = llm
         # одна обработка за раз: иначе параллельные вызовы отправят одни и те же посты в LLM
         self._lock = asyncio.Lock()
+        # указания владельца для всех запросов к нейросети (/instructions или LLM_INSTRUCTIONS)
+        self.instructions = cfg.llm_instructions
+
+    def _system(self, prompt: str) -> str:
+        if self.instructions.strip():
+            return prompt + INSTRUCTIONS_BLOCK.format(instructions=self.instructions.strip())
+        return prompt
 
     def _needs_summary(self, post: Post) -> bool:
         return len(post.text) > self.cfg.summary_threshold
@@ -212,11 +270,18 @@ class Processor:
             }
             for post in batch
         ]
-        system = SYSTEM_PROMPT.format(
-            language=self.cfg.digest_language, max_chars=self.cfg.summary_max_chars
+        with_rules = bool(self.instructions.strip())
+        system = self._system(
+            SYSTEM_PROMPT.format(
+                language=self.cfg.digest_language,
+                max_chars=self.cfg.summary_max_chars,
+                clean_rule=CLEAN_RULE if with_rules else "",
+                clean_field=', "clean": "..."' if with_rules else "",
+            )
         )
         user = json.dumps({"posts": items}, ensure_ascii=False)
-        data = await self.llm.complete_json(system, user, max_tokens=300 + 250 * len(batch))
+        per_post = 500 if with_rules else 250
+        data = await self.llm.complete_json(system, user, max_tokens=300 + per_post * len(batch))
         rows = data.get("posts", []) if isinstance(data, dict) else data
         if not isinstance(rows, list):
             raise LLMError("Ожидался список posts")
@@ -240,6 +305,11 @@ class Processor:
                     post.summarized = True
                 else:
                     self._fallback(post)
+            elif with_rules:
+                # короткий пост с применёнными указаниями: показываем его вместо оригинала
+                clean = str(row.get("clean") or "").strip()
+                if clean and clean != post.text.strip() and len(clean) <= len(post.text) * 1.5 + 50:
+                    post.summary = clean
 
     async def compress_channel(
         self, channel: Channel, posts: list[Post], budget: int
@@ -255,14 +325,16 @@ class Processor:
             if post.media_only:
                 body = f"[только медиа: {', '.join(post.media)}]"
             else:
-                body = post.summary if post.summarized and post.summary else truncate(post.text, 700)
+                body = post.summary or truncate(post.text, 700)
             items.append({"id": post.id, "text": body})
         line_chars = max(60, min(220, budget // max(1, min(len(posts), 20))))
-        system = COMPRESS_PROMPT.format(
-            channel=channel.display_name,
-            line_chars=line_chars,
-            budget=budget,
-            language=self.cfg.digest_language,
+        system = self._system(
+            COMPRESS_PROMPT.format(
+                channel=channel.display_name,
+                line_chars=line_chars,
+                budget=budget,
+                language=self.cfg.digest_language,
+            )
         )
         data = await self.llm.complete_json(
             system,
@@ -308,7 +380,7 @@ class Processor:
             return ""
         try:
             text = await self.llm.complete(
-                OVERVIEW_PROMPT.format(language=self.cfg.digest_language),
+                self._system(OVERVIEW_PROMPT.format(language=self.cfg.digest_language)),
                 "\n".join(lines),
                 max_tokens=800,
             )

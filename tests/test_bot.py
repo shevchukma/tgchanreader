@@ -185,3 +185,21 @@ async def test_digest_messages_silent_after_header(cfg):
         assert "Title bbbb_ch" in sent[2].text
     finally:
         await svc.close()
+
+
+async def test_instructions_command(cfg):
+    svc, bot, session = await make_bot(cfg)
+    try:
+        await send(bot, FRIEND, "/instructions без дисклеймеров")
+        assert "только администратору" in last_text(session, FRIEND)
+        await send(bot, ADMIN, "/instructions")
+        assert "не заданы" in last_text(session, ADMIN)
+        await send(bot, ADMIN, "/instructions Никогда не добавляй дисклеймеры.\nПиши нейтрально.")
+        assert "сохранены" in last_text(session, ADMIN)
+        assert svc.processor.instructions == "Никогда не добавляй дисклеймеры.\nПиши нейтрально."
+        await send(bot, ADMIN, "/instructions")
+        assert "Пиши нейтрально" in last_text(session, ADMIN)
+        await send(bot, ADMIN, "/instructions -")
+        assert svc.processor.instructions == ""
+    finally:
+        await svc.close()
