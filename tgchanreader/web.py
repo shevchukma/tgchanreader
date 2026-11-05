@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from datetime import datetime
 from email.utils import format_datetime
 from urllib.parse import quote
@@ -67,85 +68,137 @@ def _rss(title: str, link: str, description: str, items: list[dict]) -> str:
 
 
 def build_app(service: Service) -> web.Application:
+    """Маршруты:
+
+    /u/<token>/                    личный архив дайджестов пользователя
+    /u/<token>/digest/<id>         дайджест в браузере
+    /u/<token>/rss/digests.xml     RSS дайджестов
+    /u/<token>/rss/posts.xml[?tag] RSS постов из подписок пользователя
+    /                              без бота — архив владельца; с WEB_TOKEN — список пользователей
+    /rss/*.xml, /digest/<id>       то же для владельца (режим без бота или с WEB_TOKEN)
+    """
     cfg = service.cfg
     db = service.db
 
-    @web.middleware
-    async def auth(request: web.Request, handler):  # type: ignore[no-untyped-def]
-        if request.path == "/healthz" or not cfg.web_token:
-            return await handler(request)
+    def admin_ok(request: web.Request) -> bool:
         token = request.query.get("token") or request.headers.get("X-Token", "")
-        if token != cfg.web_token:
-            raise web.HTTPUnauthorized(text="token required")
-        return await handler(request)
+        return bool(cfg.web_token) and secrets.compare_digest(token, cfg.web_token)
 
-    def q() -> str:
-        return f"?token={cfg.web_token}" if cfg.web_token else ""
+    def owner_access(request: web.Request) -> bool:
+        if cfg.web_token:
+            return admin_ok(request)
+        return not cfg.bot_token  # режим только RSS без токена — открыто, как раньше
 
-    def url(path: str, extra: str = "") -> str:
-        base = f"{cfg.web_base_url}{path}"
-        params = [p for p in (f"token={cfg.web_token}" if cfg.web_token else "", extra) if p]
-        return base + ("?" + "&".join(params) if params else "")
+    async def user_from(request: web.Request) -> tuple[dict, str]:
+        """(пользователь, базовый путь для ссылок)"""
+        token = request.match_info.get("token")
+        if token is not None:
+            user = await db.get_user_by_token(token)
+            if not user or user["user_id"] not in service_access():
+                raise web.HTTPNotFound()
+            return user, f"/u/{token}"
+        if not owner_access(request):
+            if cfg.web_token:
+                raise web.HTTPUnauthorized(text="token required")
+            raise web.HTTPNotFound(text="Личные ссылки — в боте, команда /rss")
+        user = await db.ensure_user(service.owner_id)
+        return user, f"/u/{user['token']}"
+
+    def service_access() -> set[int]:
+        allowed = set(cfg.access_ids)
+        allowed.add(service.owner_id)
+        return allowed
+
+    def absolute(path: str) -> str:
+        return f"{cfg.web_base_url}{path}"
+
+    def html_response(title: str, body: str, rss: str) -> web.Response:
+        page = PAGE.format(title=esc(title), rss=esc_attr(rss), body=body)
+        return web.Response(text=page, content_type="text/html")
 
     async def healthz(_: web.Request) -> web.Response:
         return web.json_response({"ok": True})
 
-    async def index(_: web.Request) -> web.Response:
-        digests = await db.list_digests(60)
+    async def archive(request: web.Request) -> web.Response:
+        user, base = await user_from(request)
+        digests = await db.list_digests(user["user_id"], 60)
         items = "".join(
-            f'<li><a href="/digest/{d["id"]}{q()}">{esc(d["title"])}</a> '
+            f'<li><a href="{base}/digest/{d["id"]}">{esc(d["title"])}</a> '
             f'<span class="muted">· постов {d["stats"].get("posts", 0)}</span></li>'
             for d in digests
         ) or "<li class='muted'>Дайджестов пока нет</li>"
-        channels = await db.list_channels()
+        channels = await db.user_channels(user["user_id"])
         tags = sorted({t for c in channels for t in c.tags})
         tag_links = " ".join(
-            f'<a href="{esc_attr(url("/rss/posts.xml", "tag=" + quote(t)))}">#{esc(t)}</a>' for t in tags
+            f'<a href="{base}/rss/posts.xml?tag={esc_attr(quote(t))}">#{esc(t)}</a>' for t in tags
         )
         body = (
             "<h1>Дайджесты</h1>"
-            f'<p class="muted">RSS: <a href="/rss/digests.xml{q()}">дайджесты</a> · '
-            f'<a href="/rss/posts.xml{q()}">все посты</a>'
+            f'<p class="muted">RSS: <a href="{base}/rss/digests.xml">дайджесты</a> · '
+            f'<a href="{base}/rss/posts.xml">все посты</a>'
             + (f" · по тегам: {tag_links}" if tag_links else "")
             + f"</p><ul>{items}</ul>"
         )
-        html = PAGE.format(title="Дайджесты", rss=f"/rss/digests.xml{q()}", body=body)
-        return web.Response(text=html, content_type="text/html")
+        return html_response("Дайджесты", body, f"{base}/rss/digests.xml")
+
+    async def index(request: web.Request) -> web.Response:
+        if cfg.bot_token and admin_ok(request):
+            known = {u["user_id"]: u for u in await db.list_users(active_only=False)}
+            rows = []
+            for uid in sorted(service_access()):
+                user = known.get(uid)
+                if not user:
+                    continue
+                name = esc(user["name"] or str(uid))
+                rows.append(f'<li><a href="/u/{user["token"]}/">{name}</a></li>')
+            body = "<h1>Пользователи</h1><ul>" + ("".join(rows) or "<li>нет</li>") + "</ul>"
+            return html_response("Пользователи", body, "")
+        if not cfg.bot_token and owner_access(request):
+            return await archive(request)
+        if cfg.web_token and not admin_ok(request):
+            raise web.HTTPUnauthorized(text="token required")
+        body = (
+            "<h1>Дайджест Telegram-каналов</h1>"
+            '<p class="muted">Личные ссылки на архив и RSS выдаёт бот командой /rss.</p>'
+        )
+        return html_response("Дайджест", body, "")
 
     async def digest_page(request: web.Request) -> web.Response:
+        user, base = await user_from(request)
         try:
             digest_id = int(request.match_info["id"])
         except ValueError:
             raise web.HTTPNotFound()
         digest = await db.get_digest(digest_id)
-        if not digest:
+        if not digest or digest["user_id"] != user["user_id"]:
             raise web.HTTPNotFound()
         body = (
-            f'<p class="muted"><a href="/{q()}">← все дайджесты</a></p>'
+            f'<p class="muted"><a href="{base}/">← все дайджесты</a></p>'
             f'<div class="digest">{digest["html"]}</div>'
         )
-        html = PAGE.format(title=esc(digest["title"]), rss=f"/rss/digests.xml{q()}", body=body)
-        return web.Response(text=html, content_type="text/html")
+        return html_response(digest["title"], body, f"{base}/rss/digests.xml")
 
-    async def rss_digests(_: web.Request) -> web.Response:
-        digests = await db.list_digests(cfg.rss_items)
+    async def rss_digests(request: web.Request) -> web.Response:
+        user, base = await user_from(request)
+        digests = await db.list_digests(user["user_id"], cfg.rss_items)
         items = [
             {
                 "title": d["title"],
-                "link": url(f"/digest/{d['id']}"),
+                "link": absolute(f"{base}/digest/{d['id']}"),
                 "guid": f"digest-{d['id']}",
                 "date": d["created_at"],
                 "description": d["html"].replace("\n", "<br>\n"),
             }
             for d in digests
         ]
-        xml = _rss("Дайджест Telegram-каналов", url("/"), "Ежедневные дайджесты", items)
+        xml = _rss("Дайджест Telegram-каналов", absolute(f"{base}/"), "Дайджесты моих каналов", items)
         return web.Response(text=xml, content_type="application/rss+xml", charset="utf-8")
 
     async def rss_posts(request: web.Request) -> web.Response:
+        user, base = await user_from(request)
         tag = (request.query.get("tag") or "").strip().lstrip("#").lower() or None
         await service.processor.process_pending()
-        rows = await db.recent_posts(cfg.rss_items, tag=tag)
+        rows = await db.recent_posts_for_user(user["user_id"], cfg.rss_items, tag=tag)
         items = []
         for post, channel in rows:
             if post.media_only:
@@ -167,15 +220,25 @@ def build_app(service: Service) -> web.Application:
                 }
             )
         feed_title = "Посты Telegram-каналов" + (f" · #{tag}" if tag else "")
-        xml = _rss(feed_title, url("/"), feed_title + f" (обновлено {human_date(datetime.now(cfg.tz))})", items)
+        xml = _rss(
+            feed_title,
+            absolute(f"{base}/"),
+            feed_title + f" (обновлено {human_date(datetime.now(cfg.tz))})",
+            items,
+        )
         return web.Response(text=xml, content_type="application/rss+xml", charset="utf-8")
 
-    app = web.Application(middlewares=[auth])
+    app = web.Application()
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/", index)
     app.router.add_get("/digest/{id}", digest_page)
     app.router.add_get("/rss/digests.xml", rss_digests)
     app.router.add_get("/rss/posts.xml", rss_posts)
+    app.router.add_get("/u/{token}", archive)
+    app.router.add_get("/u/{token}/", archive)
+    app.router.add_get("/u/{token}/digest/{id}", digest_page)
+    app.router.add_get("/u/{token}/rss/digests.xml", rss_digests)
+    app.router.add_get("/u/{token}/rss/posts.xml", rss_posts)
     return app
 
 

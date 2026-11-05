@@ -20,7 +20,7 @@ async def main() -> None:
         cfg.effective_source,
         cfg.llm.provider if cfg.llm.enabled else "выключен",
         cfg.llm.model,
-        ", ".join(t.strftime("%H:%M") for t in cfg.digest_times),
+        "по умолчанию " + ", ".join(f"{h:02d}:00" for h in cfg.default_schedule),
         cfg.timezone,
     )
     service = Service(cfg)

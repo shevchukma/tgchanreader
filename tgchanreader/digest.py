@@ -212,6 +212,20 @@ class DigestBuilder:
         self.cfg = cfg
         self.db = db
         self.processor = processor
+        # результат сжатия канала переиспользуется для всех, у кого те же посты
+        self._compress_cache: dict[tuple, list[tuple[int, str]]] = {}
+        self._compress_locks: dict[tuple, asyncio.Lock] = {}
+
+    async def _compressed_keep(self, channel: Channel, posts: list[Post], budget: int) -> list[tuple[int, str]]:
+        key = (channel.id, tuple(p.id for p in posts))
+        lock = self._compress_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key not in self._compress_cache:
+                if len(self._compress_cache) > 500:
+                    self._compress_cache.clear()
+                    self._compress_locks = {key: lock}
+                self._compress_cache[key] = await self.processor.compress_channel(channel, posts, budget)
+            return self._compress_cache[key]
 
     # ---------- секции каналов ----------
 
@@ -237,7 +251,7 @@ class DigestBuilder:
         text_budget = max(400, int((budget - 12 * min(len(posts), 25)) * 0.85))
 
         try:
-            keep = await self.processor.compress_channel(channel, posts, text_budget)
+            keep = await self._compressed_keep(channel, posts, text_budget)
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось сжать %s: %s", channel.ref, exc)
             return None
@@ -278,39 +292,40 @@ class DigestBuilder:
 
     # ---------- сборка ----------
 
-    def _title(self, now: datetime) -> str:
+    def _title(self, now: datetime, multi_daily: bool) -> str:
         local = now.astimezone(self.cfg.tz)
-        if len(self.cfg.digest_times) > 1:
+        if multi_daily:
             return f"Дайджест · {human_date(local)}, {local.strftime('%H:%M')}"
         return f"Дайджест за {human_date(local)}"
 
-    async def build(self, tag: str | None = None, save: bool = True) -> Digest | None:
+    async def build(
+        self, user_id: int, tag: str | None = None, save: bool = True, multi_daily: bool = False
+    ) -> Digest | None:
+        """Дайджест пользователя по его подпискам. save=False — предпросмотр."""
         await self.processor.process_pending(final=save)
         now = datetime.now(timezone.utc)
         since = now - timedelta(hours=self.cfg.max_post_age_hours)
-        posts = await self.db.undigested_posts(since)
-        channels = {c.id: c for c in await self.db.list_channels()}
+        pending = await self.db.pending_for_user(user_id, since, self.cfg.first_fetch_hours)
 
         entries: list[tuple[Post, Channel]] = []
         ads: list[Post] = []
-        for post in posts:
-            channel = channels.get(post.channel_id)
-            if channel is None:
-                continue
+        cursors: dict[int, int] = {}
+        for post, channel in pending:
             if post.status == "new":
                 # ещё не обработан нейросетью (только в предпросмотре) — упрощённо, без сохранения
                 self.processor.apply_fallback(post)
             if tag and tag not in channel.tags:
                 continue
+            cursors[channel.id] = max(cursors.get(channel.id, 0), post.msg_id)
             if post.is_ad and self.cfg.skip_ads:
                 ads.append(post)
                 continue
             entries.append((post, channel))
 
         if not entries and not self.cfg.send_empty_digest:
-            if save and ads:
-                # пометим рекламу, чтобы не висела в очереди
-                await self.db.mark_digested([p.id for p in ads], 0)
+            if save and cursors:
+                # одна реклама — сдвинем курсор, чтобы не висела в очереди
+                await self.db.advance_cursors(user_id, cursors)
             return None
 
         entries.sort(key=sort_key)
@@ -327,7 +342,7 @@ class DigestBuilder:
         await asyncio.gather(*(self._build_section(s, can_compress) for s in sections))
         overview = await overview_task if overview_task else ""
 
-        title = self._title(now)
+        title = self._title(now, multi_daily)
         if tag:
             title += f" · #{tag}"
         stats = {
@@ -343,7 +358,7 @@ class DigestBuilder:
         if stats["ads"]:
             header += f" · пропущено рекламы: {stats['ads']}"
         if overview:
-            heading = "Главное за день" if len(self.cfg.digest_times) == 1 else "Главное"
+            heading = "Главное" if multi_daily else "Главное за день"
             header += f"\n\n🧭 <b>{heading}</b>\n{esc(overview)}"
         if not entries:
             header += "\n\nНовых постов нет 🌿"
@@ -358,6 +373,6 @@ class DigestBuilder:
             post_ids=[p.id for p, _ in entries] + [p.id for p in ads],
         )
         if save:
-            digest.id = await self.db.save_digest(title, digest.html, stats)
-            await self.db.mark_digested(digest.post_ids, digest.id)
+            digest.id = await self.db.save_digest(user_id, title, digest.html, stats)
+            await self.db.advance_cursors(user_id, cursors)
         return digest

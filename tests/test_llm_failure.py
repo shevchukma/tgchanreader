@@ -5,7 +5,7 @@ from tgchanreader.llm import LLMError, OpenAICompatibleClient
 from tgchanreader.models import RawPost
 from tgchanreader.service import Service
 
-from .conftest import FakeLLM, FakeSource, now
+from .conftest import UID, FakeLLM, FakeSource, now
 
 LONG = "Длинный пост о важном. " * 50
 
@@ -81,7 +81,7 @@ async def test_posts_deferred_until_llm_works(cfg):
     svc = Service(cfg, source=FakeSource(), llm=llm)
     await svc.start()
     try:
-        await svc.add_channel("@chan_one")
+        await svc.add_channel(UID, "@chan_one")
         svc.source.posts["chan_one"] = [
             RawPost(1, now(), LONG),
             RawPost(2, now(), "", media=["photo"]),
@@ -96,14 +96,14 @@ async def test_posts_deferred_until_llm_works(cfg):
         assert llm.calls == calls
 
         # предпросмотр показывает пост, ничего не сохраняя
-        preview = await svc.builder.build(save=False)
+        preview = await svc.builder.build(UID, save=False)
         assert preview is not None and preview.stats["posts"] == 2
         assert (await svc.db.stats())["posts_new"] == 1
 
         # нейросеть починили — пост обрабатывается ею
         svc.processor.llm = FakeLLM()
         await svc.processor.process_pending()
-        digest = await svc.builder.build()
+        digest = await svc.builder.build(UID)
         assert "Краткое содержание." in digest.html
     finally:
         await svc.close()
@@ -113,10 +113,10 @@ async def test_digest_falls_back_when_llm_down(cfg):
     svc = Service(cfg, source=FakeSource(), llm=BrokenLLM())
     await svc.start()
     try:
-        await svc.add_channel("@chan_one")
+        await svc.add_channel(UID, "@chan_one")
         svc.source.posts["chan_one"] = [RawPost(1, now(), LONG)]
         await svc.collect()
-        digest = await svc.builder.build()
+        digest = await svc.builder.build(UID)
         assert digest is not None and digest.stats["summarized"] == 1
         assert (await svc.db.stats())["posts_new"] == 0
     finally:
@@ -127,13 +127,15 @@ async def test_reprocess(cfg):
     svc = Service(cfg, source=FakeSource(), llm=None)
     await svc.start()
     try:
-        await svc.add_channel("@chan_one")
+        await svc.add_channel(UID, "@chan_one")
         svc.source.posts["chan_one"] = [RawPost(1, now(), LONG)]
         await svc.collect()
-        assert await svc.db.reset_undigested() == 1
+        from datetime import timedelta
+
+        assert await svc.db.reset_recent(now() - timedelta(hours=48)) == 1
         svc.processor.llm = FakeLLM()
         await svc.processor.process_pending()
-        digest = await svc.builder.build()
+        digest = await svc.builder.build(UID)
         assert "Краткое содержание." in digest.html
     finally:
         await svc.close()

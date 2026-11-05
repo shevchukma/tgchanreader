@@ -93,6 +93,8 @@ class Processor:
         self.cfg = cfg
         self.db = db
         self.llm = llm
+        # одна обработка за раз: иначе параллельные вызовы отправят одни и те же посты в LLM
+        self._lock = asyncio.Lock()
 
     def _needs_summary(self, post: Post) -> bool:
         return len(post.text) > self.cfg.summary_threshold
@@ -109,6 +111,10 @@ class Processor:
             self._fallback(post)
 
     async def process_pending(self, final: bool = False) -> ProcessStats:
+        async with self._lock:
+            return await self._process_pending(final)
+
+    async def _process_pending(self, final: bool = False) -> ProcessStats:
         """Обрабатывает новые посты.
 
         Если LLM недоступен и final=False, посты остаются в очереди и будут

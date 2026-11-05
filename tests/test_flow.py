@@ -4,7 +4,7 @@ from tgchanreader.digest import split_blocks, visible_len
 from tgchanreader.models import RawPost
 from tgchanreader.service import Service
 
-from .conftest import FakeLLM, FakeSource, now
+from .conftest import UID, FakeLLM, FakeSource, now
 
 LONG = "Очень длинный пост про политику. " * 40
 
@@ -20,9 +20,9 @@ async def test_full_flow(cfg):
     llm = FakeLLM(ads={"КУПИ"})
     svc, source = await make_service(cfg, llm)
     try:
-        await svc.add_channel("@politics_ch", ["политика"], 1)
-        await svc.add_channel("@velo_ch", ["велосипед"], 3)
-        await svc.add_channel("@misc_ch", None, 2)
+        await svc.add_channel(UID, "@politics_ch", ["политика"], 1)
+        await svc.add_channel(UID, "@velo_ch", ["велосипед"], 3)
+        await svc.add_channel(UID, "@misc_ch", None, 2)
 
         t = now() - timedelta(hours=2)
         source.posts["politics_ch"] = [
@@ -38,7 +38,7 @@ async def test_full_flow(cfg):
         added = await svc.collect()
         assert added == 6  # старый пост отброшен по дате
 
-        digest = await svc.builder.build()
+        digest = await svc.builder.build(UID)
         assert digest is not None
         assert digest.stats == {"posts": 4, "channels": 2, "ads": 2, "summarized": 1, "dropped": 0}
 
@@ -59,12 +59,12 @@ async def test_full_flow(cfg):
         assert "#политика" in text and "#велосипед" in text
 
         # повторно те же посты не попадают
-        assert await svc.builder.build() is None
+        assert await svc.builder.build(UID) is None
 
         # новые посты — новый дайджест
         source.posts["velo_ch"].append(RawPost(11, now(), "Новый маршрут", url="https://t.me/velo_ch/11"))
         await svc.collect()
-        d2 = await svc.builder.build()
+        d2 = await svc.builder.build(UID)
         assert d2 is not None and d2.stats["posts"] == 1
     finally:
         await svc.close()
@@ -73,15 +73,15 @@ async def test_full_flow(cfg):
 async def test_without_llm_fallback(cfg):
     svc, source = await make_service(cfg, None)
     try:
-        await svc.add_channel("@chan_one")
+        await svc.add_channel(UID, "@chan_one")
         source.posts["chan_one"] = [RawPost(1, now(), LONG)]
         await svc.collect()
-        digest = await svc.builder.build(save=False)
+        digest = await svc.builder.build(UID, save=False)
         assert digest is not None
         assert digest.stats["summarized"] == 1
         assert "Главное за день" not in digest.html
         # preview не помечает посты
-        assert await svc.builder.build(save=False) is not None
+        assert await svc.builder.build(UID, save=False) is not None
     finally:
         await svc.close()
 
@@ -89,12 +89,12 @@ async def test_without_llm_fallback(cfg):
 async def test_tag_filter(cfg):
     svc, source = await make_service(cfg, None)
     try:
-        await svc.add_channel("@aaaa_ch", ["политика"], 1)
-        await svc.add_channel("@bbbb_ch", ["велосипед"], 1)
+        await svc.add_channel(UID, "@aaaa_ch", ["политика"], 1)
+        await svc.add_channel(UID, "@bbbb_ch", ["велосипед"], 1)
         source.posts["aaaa_ch"] = [RawPost(1, now(), "про политику")]
         source.posts["bbbb_ch"] = [RawPost(1, now(), "про велосипед")]
         await svc.collect()
-        digest = await svc.builder.build(tag="велосипед", save=False)
+        digest = await svc.builder.build(UID, tag="велосипед", save=False)
         assert "про велосипед" in digest.html and "про политику" not in digest.html
     finally:
         await svc.close()
@@ -110,12 +110,15 @@ def test_split_blocks():
 
 
 async def test_next_digest_time(cfg):
-    from datetime import datetime, time, timezone
+    from datetime import datetime, timezone
 
-    cfg.digest_times = [time(8, 0), time(19, 0)]
     svc = Service(cfg, source=FakeSource(), llm=None)
+    user = {"schedule": [9, 21]}
     # 2026-11-05 10:00 МСК = 07:00 UTC
-    t = svc.next_digest_time(datetime(2026, 11, 5, 7, 0, tzinfo=timezone.utc))
-    assert (t.hour, t.day) == (19, 5)
-    t = svc.next_digest_time(datetime(2026, 11, 5, 17, 0, tzinfo=timezone.utc))
-    assert (t.hour, t.day) == (8, 6)
+    t = svc.next_digest_time(user, datetime(2026, 11, 5, 7, 0, tzinfo=timezone.utc))
+    assert (t.hour, t.day) == (21, 5)
+    t = svc.next_digest_time(user, datetime(2026, 11, 5, 19, 0, tzinfo=timezone.utc))
+    assert (t.hour, t.day) == (9, 6)
+    # общий цикл просыпается в каждый слот
+    t = svc.next_slot(now=datetime(2026, 11, 5, 7, 0, tzinfo=timezone.utc))
+    assert t.hour == 12

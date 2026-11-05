@@ -89,6 +89,24 @@ def parse_times(raw: str) -> list[time]:
     return sorted(set(times))
 
 
+# Слоты рассылки: не чаще раза в 3 часа, с 6 до 21 по местному времени.
+DIGEST_SLOTS: tuple[int, ...] = (6, 9, 12, 15, 18, 21)
+
+
+def normalize_schedule(hours) -> list[int]:  # type: ignore[no-untyped-def]
+    return sorted({int(h) for h in hours if int(h) in DIGEST_SLOTS})
+
+
+def default_schedule(raw: str) -> list[int]:
+    """DIGEST_TIMES из .env → часы-слоты (время вне слотов игнорируется)."""
+    try:
+        hours = normalize_schedule(t.hour for t in parse_times(raw) if t.minute == 0)
+    except ValueError:
+        log.warning("Не удалось разобрать DIGEST_TIMES=%r, используем 09:00", raw)
+        hours = []
+    return hours or [9]
+
+
 # Модели по умолчанию для каждого провайдера (можно переопределить LLM_MODEL).
 DEFAULT_MODELS = {
     "openrouter": "google/gemini-2.5-flash",
@@ -142,7 +160,9 @@ class Config:
 
     # Расписание
     timezone: str = "Europe/Moscow"
-    digest_times: list[time] = field(default_factory=lambda: [time(8, 0)])
+    # расписание по умолчанию для новых пользователей (часы из DIGEST_SLOTS);
+    # каждый пользователь меняет своё в боте командой /schedule
+    default_schedule: list[int] = field(default_factory=lambda: [9])
     collect_interval_minutes: int = 60
     first_fetch_hours: int = 24
     max_post_age_hours: int = 48
@@ -155,6 +175,7 @@ class Config:
     digest_overview: bool = True
     digest_language: str = "русский"
     default_priority: int = 2
+    max_channels_per_user: int = 0  # 0 — без лимита (на админов не действует)
     send_empty_digest: bool = False
 
     # Веб / RSS
@@ -226,7 +247,7 @@ def load_config() -> Config:
         tg_api_hash=_env("TG_API_HASH"),
         tg_session=_env("TG_SESSION"),
         timezone=_env("TZ", "Europe/Moscow") or "Europe/Moscow",
-        digest_times=parse_times(_env("DIGEST_TIMES", _env("DIGEST_TIME", "08:00"))),
+        default_schedule=default_schedule(_env("DIGEST_TIMES", _env("DIGEST_TIME", "09:00"))),
         collect_interval_minutes=max(5, _int("COLLECT_INTERVAL_MINUTES", 60)),
         first_fetch_hours=_int("FIRST_FETCH_HOURS", 24),
         max_post_age_hours=_int("MAX_POST_AGE_HOURS", 48),
@@ -237,6 +258,7 @@ def load_config() -> Config:
         digest_overview=_bool("DIGEST_OVERVIEW", True),
         digest_language=_env("DIGEST_LANGUAGE", "русский"),
         default_priority=_int("DEFAULT_PRIORITY", 2),
+        max_channels_per_user=_int("MAX_CHANNELS_PER_USER", 0),
         send_empty_digest=_bool("SEND_EMPTY_DIGEST", False),
         web_enabled=_bool("WEB_ENABLED", True),
         web_host=_env("WEB_HOST", "0.0.0.0"),
@@ -249,8 +271,6 @@ def load_config() -> Config:
         llm=llm,
     )
 
-    if not cfg.digest_times:
-        cfg.digest_times = [time(8, 0)]
     if cfg.source not in {"auto", "web", "telethon"}:
         raise ValueError("SOURCE должен быть auto, web или telethon")
     if cfg.source == "telethon" and not cfg.telethon_configured:

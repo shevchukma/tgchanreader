@@ -10,6 +10,9 @@ from tgchanreader.models import Channel, RawPost
 from tgchanreader.sources import ChannelInfo, Source
 
 
+UID = 1
+
+
 class FakeSource(Source):
     name = "fake"
 

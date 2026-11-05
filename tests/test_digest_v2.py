@@ -7,7 +7,7 @@ from tgchanreader.digest import MESSAGE_LIMIT, visible_len
 from tgchanreader.models import RawPost
 from tgchanreader.service import Service
 
-from .conftest import FakeLLM, FakeSource, now
+from .conftest import UID, FakeLLM, FakeSource, now
 
 
 def test_parse_times_range():
@@ -50,8 +50,8 @@ def busy_channel_posts(n=40):
 async def make(cfg, llm):
     svc = Service(cfg, source=FakeSource(), llm=llm)
     await svc.start()
-    await svc.add_channel("@busy_ch", ["город"], 1)
-    await svc.add_channel("@calm_ch", None, 2)
+    await svc.add_channel(UID, "@busy_ch", ["город"], 1)
+    await svc.add_channel(UID, "@calm_ch", None, 2)
     svc.source.posts["busy_ch"] = busy_channel_posts()
     svc.source.posts["calm_ch"] = [RawPost(1, now(), "Одна спокойная новость")]
     await svc.collect()
@@ -62,7 +62,7 @@ async def test_busy_channel_compressed_into_one_message(cfg):
     llm = CompressingLLM()
     svc = await make(cfg, llm)
     try:
-        digest = await svc.builder.build()
+        digest = await svc.builder.build(UID)
         messages = digest.messages()
         assert len(messages) == 3  # шапка + 2 канала
         busy = messages[1]
@@ -80,7 +80,7 @@ async def test_busy_channel_compressed_into_one_message(cfg):
 async def test_busy_channel_without_llm_is_split(cfg):
     svc = await make(cfg, None)
     try:
-        digest = await svc.builder.build()
+        digest = await svc.builder.build(UID)
         messages = digest.messages()
         busy_parts = [m for m in messages if "busy_ch" in m.split("\n")[0]]
         assert len(busy_parts) > 1
@@ -102,19 +102,19 @@ async def test_compression_respects_limit_even_if_llm_ignores_budget(cfg):
 
     svc = await make(cfg, GreedyLLM())
     try:
-        digest = await svc.builder.build()
+        digest = await svc.builder.build(UID)
         assert all(visible_len(m) <= MESSAGE_LIMIT for m in digest.messages())
         assert digest.stats["dropped"] > 0
     finally:
         await svc.close()
 
 
-async def test_subscribers(cfg, db):
+async def test_users(cfg, db):
     assert await db.subscribe(1, 1, "Admin") is True
     assert await db.subscribe(1, 1, "") is False
-    await db.ensure_subscriber(2)
+    await db.ensure_user(2)
     await db.unsubscribe(2)
-    await db.ensure_subscriber(2)  # не переподписывает отписавшегося
-    subs = await db.list_subscribers()
-    assert [s["user_id"] for s in subs] == [1]
-    assert subs[0]["name"] == "Admin"
+    await db.ensure_user(2)  # не включает обратно того, кто отписался
+    users = await db.list_users()
+    assert [u["user_id"] for u in users] == [1]
+    assert users[0]["name"] == "Admin" and users[0]["token"]

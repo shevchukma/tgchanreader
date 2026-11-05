@@ -28,6 +28,9 @@ class Channel:
     priority: int = 2
     active: bool = True
     last_post_id: int = 0
+    # поля подписки конкретного пользователя (если канал получен через подписку)
+    cursor: int = 0
+    subscribed_at: datetime | None = None
 
     @property
     def display_name(self) -> str:
