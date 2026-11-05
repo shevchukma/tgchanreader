@@ -17,6 +17,7 @@ from .db import Database
 from .digest import Digest, DigestBuilder
 from .llm import LLMClient, build_llm
 from .models import Channel, normalize_ref, parse_tags
+from .cleanup import parse_rules, strip_lines
 from .processor import Processor, strip_disclaimers
 from .sources import Source, SourceError, build_source
 
@@ -44,6 +45,9 @@ class Service:
         self._digest_lock = asyncio.Lock()
         self._tasks: list[asyncio.Task] = []
         self._bg: set[asyncio.Task] = set()
+        self.strip_rules = parse_rules(cfg.strip_lines)
+        if self.strip_rules:
+            log.info("STRIP_LINES: правил %d", len(self.strip_rules))
 
     @property
     def owner_id(self) -> int:
@@ -174,11 +178,17 @@ class Service:
         log.info("Синхронизировано каналов из %s: %d", path, count)
         return count
 
-    async def set_instructions(self, text: str) -> None:
-        """Указания нейросети. Пустая строка — без указаний (перекрывает LLM_INSTRUCTIONS)."""
-        text = text.strip()
-        await self.db.set_setting("llm_instructions", text or "-")
-        self.processor.instructions = text
+    async def set_instructions(self, text: str | None) -> str:
+        """Указания нейросети из бота. None — вернуться к LLM_INSTRUCTIONS из .env,
+        пустая строка — без указаний (перекрывает .env)."""
+        if text is None:
+            await self.db.set_setting("llm_instructions", "")
+            self.processor.instructions = self.cfg.llm_instructions
+        else:
+            text = text.strip()
+            await self.db.set_setting("llm_instructions", text or "-")
+            self.processor.instructions = text
+        return self.processor.instructions
 
     # ---------- сбор (общий для всех пользователей) ----------
 
@@ -194,9 +204,11 @@ class Service:
         except SourceError as exc:
             log.warning("Не удалось прочитать %s: %s", channel.ref, exc)
             return 0
-        if self.cfg.strip_disclaimers:
+        if self.cfg.strip_disclaimers or self.strip_rules:
             for post in posts:
-                post.text = strip_disclaimers(post.text)
+                if self.cfg.strip_disclaimers:
+                    post.text = strip_disclaimers(post.text)
+                post.text = strip_lines(post.text, self.strip_rules, channel.ref)
             posts = [p for p in posts if p.text or p.media]
         added = await self.db.add_posts(channel, posts)
         if added:

@@ -173,6 +173,7 @@ class Config:
     short_post_max_chars: int = 800  # короткие посты всё равно обрезаем до этой длины
     skip_ads: bool = True
     strip_disclaimers: bool = True  # вырезать плашку «иноагента»
+    strip_lines: str = ""  # свои строки для вырезания, см. cleanup.py
     llm_instructions: str = ""  # указания нейросети по умолчанию (меняются в боте: /instructions)
     digest_overview: bool = True
     digest_language: str = "русский"
@@ -258,6 +259,7 @@ def load_config() -> Config:
         short_post_max_chars=_int("SHORT_POST_MAX_CHARS", 800),
         skip_ads=_bool("SKIP_ADS", True),
         strip_disclaimers=_bool("STRIP_DISCLAIMERS", True),
+        strip_lines=os.environ.get("STRIP_LINES", ""),
         llm_instructions=os.environ.get("LLM_INSTRUCTIONS", "").replace("\\n", "\n").strip(),
         digest_overview=_bool("DIGEST_OVERVIEW", True),
         digest_language=_env("DIGEST_LANGUAGE", "русский"),

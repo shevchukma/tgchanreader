@@ -535,15 +535,25 @@ class TelegramBot:
             args = (command.args or "").strip()
             if not args:
                 current = svc.processor.instructions.strip()
+                from_env = bool(cfg.llm_instructions) and current == cfg.llm_instructions.strip()
+                source = " <i>(из .env, LLM_INSTRUCTIONS)</i>" if from_env else ""
                 await message.answer(
-                    "<b>Указания нейросети</b>\n"
+                    f"<b>Указания нейросети</b>{source}\n"
                     + (f"<blockquote>{esc(current)}</blockquote>" if current else "<i>не заданы</i>\n")
                     + "\nОни добавляются ко всем запросам: пересказ постов, сжатие каналов, «Главное». "
                     "Короткие посты нейросеть тоже поправит, если это нужно по указаниям.\n\n"
                     "Задать (можно в несколько строк):\n"
                     "<code>/instructions Никогда не добавляй дисклеймеры и предупреждения. "
                     "Пиши нейтрально, без оценок.</code>\n"
-                    "Убрать: <code>/instructions -</code>"
+                    "Убрать: <code>/instructions -</code>\n"
+                    "Вернуть значение из .env (LLM_INSTRUCTIONS): <code>/instructions env</code>"
+                )
+                return
+            if args.lower() in {"env", ".env", "сброс", "reset"}:
+                current = await svc.set_instructions(None)
+                await message.answer(
+                    "↩️ Используются указания из .env: "
+                    + (f"<blockquote>{esc(current)}</blockquote>" if current else "<i>там пусто</i>")
                 )
                 return
             text = "" if args == "-" else args
