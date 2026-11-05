@@ -45,9 +45,11 @@ async def test_shared_channel_processed_once(cfg):
         assert "Краткое содержание." in da.html and "Краткое содержание." in db_.html
         assert "только Бобу" not in da.html and "только Бобу" in db_.html
         # свои теги и приоритеты
-        assert "#новости" in da.messages()[1] and da.messages()[1].startswith("🔴")
+        assert da.messages()[1].endswith("#новости")
         bob_shared = [m for m in db_.messages() if "shared_ch" in m.split("\n")[0]][0]
-        assert "#работа" in bob_shared and bob_shared.startswith("🟡")
+        assert bob_shared.endswith("#работа")
+        # у Боба приоритет 1 у bob_only, 3 у shared_ch — порядок по приоритету
+        assert db_.messages().index(bob_shared) == 2
 
         # у каждого свой курсор: Алиса прочитала — Бобу всё равно придёт новое
         svc.source.posts["shared_ch"].append(RawPost(3, now(), "свежее"))

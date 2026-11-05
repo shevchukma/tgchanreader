@@ -47,8 +47,11 @@ async def test_full_flow(cfg):
         messages = digest.messages()
         assert len(messages) == 3
         assert "Дайджест" in messages[0] and "Главное за день" in messages[0]
-        assert messages[1].startswith("🔴") and "Title politics_ch" in messages[1].split("\n")[0]
-        assert messages[2].startswith("🟡") and "Title velo_ch" in messages[2].split("\n")[0]
+        # приоритет определяет только порядок; в сообщении его нет, теги — в самом низу
+        assert messages[1].startswith("<b>") and "Title politics_ch" in messages[1].split("\n")[0]
+        assert "Title velo_ch" in messages[2].split("\n")[0]
+        assert messages[1].endswith("#политика") and messages[2].endswith("#велосипед")
+        assert "ПРИОРИТЕТ" not in text and "🔴" not in text and " пост" not in messages[1].split("\n\n")[0]
         assert "Краткое содержание." in text and "читать полностью" in text
         assert 'href="https://t.me/politics_ch/1"' in text
         assert "Короткая новость" in text

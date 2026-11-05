@@ -26,7 +26,6 @@ log = logging.getLogger(__name__)
 TELEGRAM_LIMIT = 4096
 MESSAGE_LIMIT = 4000
 
-PRIORITY_ICONS = {1: "🔴", 2: "🟠", 3: "🟡"}
 MEDIA_ICONS = {
     "photo": "🖼",
     "video": "🎬",
@@ -144,15 +143,17 @@ def render_compact(post: Post, text: str, cfg: Config) -> str:
     return f'▫️ <a href="{url}">{_time(post, cfg)}</a>{icons} {body}'
 
 
-def channel_header(channel: Channel, count: int, note: str = "") -> str:
-    icon = PRIORITY_ICONS.get(channel.priority, "⚪")
-    line = f'{icon} <b><a href="{esc_attr(channel.link)}">{esc(channel.display_name)}</a></b>'
-    tags = " ".join(f"#{esc(t)}" for t in channel.tags)
-    meta = [f"{count} {plural(count, 'пост', 'поста', 'постов')}"]
-    if note:
-        meta.append(note)
-    line += "\n<i>" + (f"{tags} · " if tags else "") + " · ".join(meta) + "</i>"
+def channel_header(channel: Channel, continued: bool = False) -> str:
+    line = f'<b><a href="{esc_attr(channel.link)}">{esc(channel.display_name)}</a></b>'
+    if continued:
+        line += " <i>(продолжение)</i>"
     return line
+
+
+def channel_tags(channel: Channel) -> str:
+    """Теги канала — в самом низу сообщения."""
+    tags = " ".join(f"#{esc(t)}" for t in channel.tags)
+    return f"\n\n{tags}" if tags else ""
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
@@ -230,23 +231,28 @@ class DigestBuilder:
     # ---------- секции каналов ----------
 
     def _render_full(self, section: Section) -> list[str]:
-        header = channel_header(section.channel, len(section.posts))
+        channel = section.channel
+        header = channel_header(channel)
+        tags = channel_tags(channel)
         blocks = [render_post(p, self.cfg) for p in section.posts]
-        text = header + "\n\n" + "\n\n".join(blocks)
+        text = header + "\n\n" + "\n\n".join(blocks) + tags
         if visible_len(text) <= MESSAGE_LIMIT:
             return [text]
-        # не влезает и сжать нечем — делим на части с повтором заголовка
-        cont = channel_header(section.channel, len(section.posts), "продолжение")
-        budget = MESSAGE_LIMIT - visible_len(cont) - 2
+        # не влезает и сжать нечем — делим на части с повтором заголовка, теги — в последней
+        cont = channel_header(channel, continued=True)
+        budget = MESSAGE_LIMIT - visible_len(cont) - visible_len(tags) - 2
         chunks = split_blocks(blocks, budget, sep="\n\n")
-        return [(header if i == 0 else cont) + "\n\n" + c for i, c in enumerate(chunks)]
+        parts = [(header if i == 0 else cont) + "\n\n" + c for i, c in enumerate(chunks)]
+        parts[-1] += tags
+        return parts
 
     async def _compress(self, section: Section) -> list[str] | None:
         """Отбор и сжатие постов канала нейросетью, чтобы всё влезло в одно сообщение."""
         channel, posts = section.channel, section.posts
-        header_probe = channel_header(channel, len(posts), "сжато, без мелочей")
+        header = channel_header(channel)
+        tags = channel_tags(channel)
         footer_reserve = 120
-        budget = MESSAGE_LIMIT - visible_len(header_probe) - footer_reserve
+        budget = MESSAGE_LIMIT - visible_len(header) - visible_len(tags) - footer_reserve
         # на каждую строку уходит ~12 символов на «▫️ 09:15 » и перевод строки
         text_budget = max(400, int((budget - 12 * min(len(posts), 25)) * 0.85))
 
@@ -264,16 +270,13 @@ class DigestBuilder:
         while chosen:
             lines = [render_compact(p, t, self.cfg) for p, t in sorted(chosen, key=lambda x: x[0].posted_at)]
             dropped = len(posts) - len(chosen)
-            note = "сжато, без мелочей" if dropped else "сжато"
-            header = channel_header(channel, len(posts), note)
-            body = "\n".join(lines)
             footer = ""
             if dropped:
                 footer = (
                     f"\n\n<i>…и ещё {dropped} {plural(dropped, 'пост', 'поста', 'постов')} "
                     f'поменьше — <a href="{esc_attr(channel.link)}">в канале</a></i>'
                 )
-            text = header + "\n\n" + body + footer
+            text = header + "\n\n" + "\n".join(lines) + footer + tags
             if visible_len(text) <= MESSAGE_LIMIT:
                 section.compressed = True
                 section.dropped = dropped

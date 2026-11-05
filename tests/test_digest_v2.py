@@ -67,12 +67,12 @@ async def test_busy_channel_compressed_into_one_message(cfg):
         assert len(messages) == 3  # шапка + 2 канала
         busy = messages[1]
         assert visible_len(busy) <= MESSAGE_LIMIT
-        assert "сжато" in busy and "Суть поста" in busy
+        assert "Суть поста" in busy and busy.endswith("#город")
         assert "…и ещё" in busy and 'href="https://t.me/busy_ch"' in busy
         assert llm.compress_calls == 1
         assert digest.stats["dropped"] >= 20
         # спокойный канал не сжимался
-        assert "Одна спокойная новость" in messages[2] and "сжато" not in messages[2]
+        assert "Одна спокойная новость" in messages[2] and "…и ещё" not in messages[2]
     finally:
         await svc.close()
 
