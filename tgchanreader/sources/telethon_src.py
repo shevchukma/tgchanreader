@@ -90,6 +90,28 @@ class TelethonSource(Source):
             raise SourceError(f"{ref} — это не канал")
         return ChannelInfo(ref=ref, title=getattr(entity, "title", "") or ref)
 
+    async def resolve_invite(self, invite_hash: str) -> ChannelInfo:
+        from telethon.errors import InviteHashExpiredError, InviteHashInvalidError
+        from telethon.tl.functions.messages import CheckChatInviteRequest
+        from telethon.tl.types import ChatInviteAlready, ChatInvitePeek
+
+        try:
+            result = await self._client(CheckChatInviteRequest(invite_hash))
+        except (InviteHashExpiredError, InviteHashInvalidError) as exc:
+            raise SourceError("Ссылка-приглашение недействительна или устарела") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise SourceError(f"Не удалось проверить приглашение: {exc}") from exc
+        if isinstance(result, (ChatInviteAlready, ChatInvitePeek)):
+            chat = result.chat
+            username = getattr(chat, "username", None)
+            ref = username.lower() if username else f"-100{chat.id}"
+            return ChannelInfo(ref=ref, title=getattr(chat, "title", "") or ref)
+        title = getattr(result, "title", "") or "канал"
+        raise SourceError(
+            f"Аккаунт, через который бот читает каналы, не состоит в «{title}». "
+            "Вступите в канал по этой ссылке с этого аккаунта и повторите /add."
+        )
+
     async def fetch(self, channel: Channel, since: datetime) -> list[RawPost]:
         entity = await self._entity(channel.ref)
         username = getattr(entity, "username", None)
@@ -174,6 +196,9 @@ class CombinedSource(Source):
             if self.fallback and not ref.lstrip("-").isdigit():
                 return await self.fallback.resolve(ref)
             raise
+
+    async def resolve_invite(self, invite_hash: str) -> ChannelInfo:
+        return await self.primary.resolve_invite(invite_hash)
 
     async def fetch(self, channel: Channel, since: datetime) -> list[RawPost]:
         try:

@@ -16,7 +16,7 @@ from .config import DIGEST_SLOTS, Config, normalize_schedule
 from .db import Database
 from .digest import Digest, DigestBuilder
 from .llm import LLMClient, build_llm
-from .models import Channel, normalize_ref, parse_tags
+from .models import Channel, is_invite, normalize_ref, parse_tags
 from .processor import Processor
 from .sources import Source, SourceError, build_source
 
@@ -85,8 +85,17 @@ class Service:
         """Подписывает пользователя на канал (или обновляет теги/приоритет)."""
         ref = normalize_ref(raw_ref)
         if not ref:
-            raise ValueError(f"Не понимаю, что за канал: {raw_ref}")
+            raise ValueError(
+                f"Не понимаю, что за канал: {raw_ref}\n"
+                "Подойдёт @имя_канала, ссылка t.me/имя_канала, ссылка на любой пост канала "
+                "или приглашение t.me/+… (для приватных, только с Telethon)."
+            )
         await self.db.ensure_user(user_id)
+        if is_invite(ref):
+            info = await self.source.resolve_invite(ref[1:])
+            ref = info.ref
+            if await self.db.get_channel(ref) is None:
+                await self.db.get_or_create_channel(info.ref, info.title)
 
         existing = await self.db.user_channel(user_id, ref)
         if existing:
@@ -132,6 +141,11 @@ class Service:
         ref = normalize_ref(raw_ref)
         if not ref:
             return None
+        if is_invite(ref):
+            try:
+                ref = (await self.source.resolve_invite(ref[1:])).ref
+            except SourceError:
+                return None
         return await self.db.user_channel(user_id, ref)
 
     async def remove_channel(self, user_id: int, channel: Channel) -> None:
