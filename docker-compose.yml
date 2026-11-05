@@ -1,0 +1,11 @@
+services:
+  tgchanreader:
+    image: velikoross/tgchanreader:latest
+    # build: .   # раскомментируйте, чтобы собрать образ локально
+    container_name: tgchanreader
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"   # веб-архив и RSS; уберите, если не нужен
+    volumes:
+      - ./data:/data

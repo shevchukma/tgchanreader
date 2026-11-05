@@ -1,0 +1,223 @@
+"""Обработка постов: выявление рекламы и сокращение длинных текстов."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from dataclasses import dataclass
+
+from .config import Config
+from .db import Database
+from .llm import LLMClient, LLMError
+from .models import Channel, Post
+
+log = logging.getLogger(__name__)
+
+# Маркировка рекламы по закону РФ (erid) и типичные хэштеги/фразы.
+AD_PATTERNS = [
+    re.compile(r"\berid\s*[:=]?\s*[A-Za-z0-9]{5,}", re.I),
+    re.compile(r"#(реклама|промо|promo|ad|ads|sponsored|партнер|партнёр|партнерский|партнёрский)\b", re.I),
+    re.compile(r"(^|\n)\s*реклама[\s.:,]", re.I),
+    re.compile(r"на правах рекламы", re.I),
+    re.compile(r"рекламодатель\s*:", re.I),
+    re.compile(r"\bИНН\s*\d{10,12}\b.*реклам", re.I | re.S),
+]
+
+
+def heuristic_is_ad(text: str) -> bool:
+    return any(p.search(text) for p in AD_PATTERNS)
+
+
+def truncate(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # обрезаем по границе предложения или слова
+    for sep in (". ", "! ", "? ", "\n"):
+        idx = cut.rfind(sep)
+        if idx > limit * 0.6:
+            return cut[: idx + 1].rstrip() + " …"
+    idx = cut.rfind(" ")
+    if idx > limit * 0.6:
+        cut = cut[:idx]
+    return cut.rstrip() + "…"
+
+
+SYSTEM_PROMPT = """Ты помогаешь составлять ежедневный дайджест Telegram-каналов.
+Для каждого поста определи:
+1. is_ad — является ли пост рекламой: платная интеграция, продвижение товара/услуги/чужого канала,
+   розыгрыш ради подписок, реферальные ссылки, промокоды, маркировка erid. Анонсы собственных
+   материалов автора канала и обычные новости рекламой НЕ являются.
+2. summary — краткий пересказ поста на языке: {language}.
+   * Если у поста стоит "need_summary": true — сократи до 1–3 предложений
+     (не длиннее {max_chars} символов), сохранив главные факты, цифры и выводы.
+   * Если "need_summary": false — верни пустую строку "".
+   * Без вступлений вроде «В посте говорится», сразу суть.
+Ответь ТОЛЬКО JSON без пояснений в формате:
+{{"posts": [{{"id": <id>, "is_ad": true|false, "summary": "..."}}]}}"""
+
+OVERVIEW_PROMPT = """Ты редактор утреннего дайджеста Telegram-каналов. Тебе дан список
+новостей за сутки (канал, теги, текст). Напиши блок «Главное за день»: 3–6 самых
+важных пунктов, каждый — одно короткое предложение. Объединяй повторяющиеся
+сюжеты из разных каналов. Язык: {language}. Ответь только списком пунктов, каждый
+с новой строки, начиная с «• ». Без заголовка и без Markdown-разметки."""
+
+
+@dataclass
+class ProcessStats:
+    processed: int = 0
+    ads: int = 0
+    summarized: int = 0
+    llm_errors: int = 0
+
+
+class Processor:
+    def __init__(self, cfg: Config, db: Database, llm: LLMClient | None):
+        self.cfg = cfg
+        self.db = db
+        self.llm = llm
+
+    def _needs_summary(self, post: Post) -> bool:
+        return len(post.text) > self.cfg.summary_threshold
+
+    def _fallback(self, post: Post) -> None:
+        if self._needs_summary(post):
+            post.summary = truncate(post.text, self.cfg.summary_max_chars)
+            post.summarized = True
+
+    async def process_pending(self) -> ProcessStats:
+        stats = ProcessStats()
+        posts = await self.db.posts_by_status("new")
+        if not posts:
+            return stats
+
+        to_llm: list[Post] = []
+        for post in posts:
+            if post.media_only or not post.text.strip():
+                post.is_ad = False
+            elif heuristic_is_ad(post.text):
+                post.is_ad = True
+            elif self.llm:
+                to_llm.append(post)
+                continue
+            else:
+                self._fallback(post)
+            await self.db.save_processing(post)
+        await self.db.commit()
+
+        if to_llm:
+            batches = self._batches(to_llm)
+            results = await asyncio.gather(
+                *(self._process_batch(b) for b in batches), return_exceptions=True
+            )
+            for batch, res in zip(batches, results):
+                if isinstance(res, Exception):
+                    log.warning("Ошибка LLM, используем упрощённую обработку: %s", res)
+                    stats.llm_errors += 1
+                    for post in batch:
+                        self._fallback(post)
+                for post in batch:
+                    await self.db.save_processing(post)
+            await self.db.commit()
+
+        for post in posts:
+            stats.processed += 1
+            stats.ads += int(post.is_ad)
+            stats.summarized += int(post.summarized)
+        log.info(
+            "Обработано постов: %d (реклама: %d, сокращено: %d)",
+            stats.processed, stats.ads, stats.summarized,
+        )
+        return stats
+
+    def _batches(self, posts: list[Post]) -> list[list[Post]]:
+        batches: list[list[Post]] = []
+        current: list[Post] = []
+        size = 0
+        limit = self.cfg.llm.batch_max_chars
+        for post in posts:
+            length = min(len(post.text), limit)
+            if current and (len(current) >= self.cfg.llm.batch_size or size + length > limit):
+                batches.append(current)
+                current, size = [], 0
+            current.append(post)
+            size += length
+        if current:
+            batches.append(current)
+        return batches
+
+    async def _process_batch(self, batch: list[Post]) -> None:
+        assert self.llm
+        items = [
+            {
+                "id": post.id,
+                "need_summary": self._needs_summary(post),
+                "text": post.text[: self.cfg.llm.batch_max_chars],
+            }
+            for post in batch
+        ]
+        system = SYSTEM_PROMPT.format(
+            language=self.cfg.digest_language, max_chars=self.cfg.summary_max_chars
+        )
+        user = json.dumps({"posts": items}, ensure_ascii=False)
+        data = await self.llm.complete_json(system, user, max_tokens=300 + 250 * len(batch))
+        rows = data.get("posts", []) if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            raise LLMError("Ожидался список posts")
+        by_id = {}
+        for row in rows:
+            if isinstance(row, dict) and "id" in row:
+                try:
+                    by_id[int(row["id"])] = row
+                except (TypeError, ValueError):
+                    continue
+        for post in batch:
+            row = by_id.get(post.id)
+            if row is None:
+                self._fallback(post)
+                continue
+            post.is_ad = bool(row.get("is_ad", False))
+            summary = str(row.get("summary") or "").strip()
+            if self._needs_summary(post):
+                if summary:
+                    post.summary = truncate(summary, self.cfg.summary_max_chars + 150)
+                    post.summarized = True
+                else:
+                    self._fallback(post)
+
+    async def overview(self, entries: list[tuple[Post, Channel]]) -> str:
+        """Блок «Главное за день» по всем постам дайджеста."""
+        if not self.llm or not entries:
+            return ""
+        lines = []
+        budget = 20000
+        for post, channel in entries:
+            body = post.summary or truncate(post.text, 400)
+            if not body:
+                continue
+            tags = ", ".join(channel.tags)
+            line = f"[{channel.display_name}{' | ' + tags if tags else ''}] {body}"
+            budget -= len(line)
+            if budget < 0:
+                break
+            lines.append(line)
+        if len(lines) < 3:
+            return ""
+        try:
+            text = await self.llm.complete(
+                OVERVIEW_PROMPT.format(language=self.cfg.digest_language),
+                "\n".join(lines),
+                max_tokens=800,
+            )
+        except LLMError as exc:
+            log.warning("Не удалось построить обзор дня: %s", exc)
+            return ""
+        bullets = [
+            "• " + line.strip().lstrip("•-*· ").strip()
+            for line in text.splitlines()
+            if line.strip().lstrip("•-*· ").strip()
+        ]
+        return "\n".join(bullets[:8])

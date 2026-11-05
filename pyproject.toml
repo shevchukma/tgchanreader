@@ -1,0 +1,17 @@
+[project]
+name = "tgchanreader"
+version = "0.1.0"
+description = "Ежедневные дайджесты Telegram-каналов: саммари длинных постов, фильтр рекламы, теги и приоритеты, RSS"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[project.scripts]
+tgchanreader = "tgchanreader.__main__:run"
+
+[tool.setuptools.packages.find]
+include = ["tgchanreader*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
