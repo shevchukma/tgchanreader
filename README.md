@@ -86,11 +86,11 @@ mkdir tgchanreader && cd tgchanreader
 ```
 
 ```bash
-curl -O https://raw.githubusercontent.com/shevchukma/tgchanreader/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/velikoross/tgchanreader/main/docker-compose.yml
 ```
 
 ```bash
-curl -o .env https://raw.githubusercontent.com/shevchukma/tgchanreader/main/.env.example
+curl -o .env https://raw.githubusercontent.com/velikoross/tgchanreader/main/.env.example
 ```
 
 4. Впишите в `.env` `BOT_TOKEN`, `LLM_API_KEY` и `ADMIN_IDS`. Свой ID можно не искать заранее: запустите контейнер,

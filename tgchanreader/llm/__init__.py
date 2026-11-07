@@ -161,7 +161,7 @@ class OpenAICompatibleClient(LLMClient):
         if self.cfg.api_key:
             headers["Authorization"] = f"Bearer {self.cfg.api_key}"
         if self.cfg.provider == "openrouter":
-            headers["HTTP-Referer"] = "https://github.com/shevchukma/tgchanreader"
+            headers["HTTP-Referer"] = "https://github.com/velikoross/tgchanreader"
             headers["X-Title"] = "tgchanreader"
         payload = {
             "model": self.cfg.model,
