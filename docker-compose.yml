@@ -5,7 +5,9 @@ services:
     container_name: tgchanreader
     restart: unless-stopped
     env_file: .env
+    # Веб-архив и RSS. Порт открыт только для самого сервера; чтобы публиковать наружу,
+    # поставьте перед ним reverse proxy с HTTPS (Caddy, nginx) и задайте WEB_BASE_URL.
     ports:
-      - "8080:8080"   # веб-архив и RSS; уберите, если не нужен
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./data:/data

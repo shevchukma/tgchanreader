@@ -232,7 +232,7 @@ class TelegramBot:
 
     def digest_messages(self, digest: Digest, user: dict[str, Any] | None) -> list[str]:
         messages = digest.messages()
-        if digest.id and user and self.service.cfg.web_enabled:
+        if digest.id and user and self.service.cfg.public_web:
             link = self.user_link(user, f"/digest/{digest.id}")
             messages[0] += f'\n\n🌐 <a href="{esc(link)}">Открыть в браузере</a>'
         return messages
@@ -436,8 +436,11 @@ class TelegramBot:
 
         @r.message(Command("rss", "web"))
         async def rss(message: Message, uid: int) -> None:
-            if not cfg.web_enabled:
-                await message.answer("Веб-интерфейс выключен (WEB_ENABLED=false).")
+            if not cfg.public_web:
+                await message.answer(
+                    "Веб-архив и RSS не опубликованы. Чтобы ими пользоваться, сделайте сервис доступным "
+                    "из интернета (через домен и HTTPS) и укажите его адрес в WEB_BASE_URL."
+                )
                 return
             user = await db.ensure_user(uid)
             tags = sorted({t for ch in await db.user_channels(uid) for t in ch.tags})

@@ -393,7 +393,7 @@ class Processor:
             text = await self.llm.complete(
                 self._system(OVERVIEW_PROMPT.format(language=self.cfg.digest_language)),
                 "\n".join(lines),
-                max_tokens=800,
+                max_tokens=2000,
             )
         except LLMError as exc:
             log.warning("Не удалось построить обзор дня: %s", exc)
@@ -403,4 +403,6 @@ class Processor:
             for line in text.splitlines()
             if line.strip().lstrip("•-*· ").strip()
         ]
+        if getattr(text, "truncated", False) and bullets:
+            bullets.pop()  # последний пункт оборван на полуслове
         return "\n".join(bullets[:8])

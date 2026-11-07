@@ -134,6 +134,10 @@ class LLMConfig:
     max_concurrency: int = 3
     batch_size: int = 8
     batch_max_chars: int = 12000
+    # минимальный лимит ответа: «размышляющие» модели тратят часть токенов на рассуждения
+    max_tokens: int = 8000
+    # OpenRouter: размышления модели — "" (как решит модель), off, low, medium, high
+    reasoning: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -185,7 +189,7 @@ class Config:
     web_enabled: bool = True
     web_host: str = "0.0.0.0"
     web_port: int = 8080
-    web_base_url: str = "http://localhost:8080"
+    web_base_url: str = "http://localhost:8080"  # внешний адрес; localhost — ссылки не показываются
     web_token: str = ""
     rss_items: int = 50
 
@@ -214,6 +218,14 @@ class Config:
         return self.source
 
     @property
+    def public_web(self) -> bool:
+        """Веб-интерфейс доступен снаружи (задан WEB_BASE_URL не на localhost)."""
+        from urllib.parse import urlparse
+
+        host = urlparse(self.web_base_url).hostname or ""
+        return self.web_enabled and host not in {"", "localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+    @property
     def access_ids(self) -> set[int]:
         """Все, кому разрешено пользоваться ботом."""
         return set(self.admin_ids) | set(self.allowed_ids)
@@ -231,6 +243,8 @@ def load_config() -> Config:
         max_concurrency=max(1, _int("LLM_MAX_CONCURRENCY", 3)),
         batch_size=max(1, _int("LLM_BATCH_SIZE", 8)),
         batch_max_chars=_int("LLM_BATCH_MAX_CHARS", 12000),
+        max_tokens=max(256, _int("LLM_MAX_TOKENS", 8000)),
+        reasoning=_env("LLM_REASONING").lower(),
     )
 
     data_dir = _env("DATA_DIR", "/data")

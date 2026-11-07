@@ -79,12 +79,19 @@ async def _serve(service: Service) -> None:
             await runner.cleanup()
 
 
+def _drop_bad_requests(record: logging.LogRecord) -> bool:
+    exc = record.exc_info[1] if record.exc_info else None
+    return not (exc and type(exc).__name__ in {"BadStatusLine", "BadHttpMessage", "BadHttpMethod"})
+
+
 def run() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    # сканеры интернета шлют на порт мусор (TLS, бинарные данные) — это не ошибки сервиса
+    logging.getLogger("aiohttp.server").addFilter(_drop_bad_requests)
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
     asyncio.run(main())
 

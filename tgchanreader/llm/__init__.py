@@ -28,6 +28,28 @@ class LLMError(Exception):
     pass
 
 
+class LLMText(str):
+    """Ответ модели; truncated=True — ответ обрезан лимитом токенов."""
+
+    truncated: bool = False
+
+
+def _text(content: str, truncated: bool) -> LLMText:
+    result = LLMText(content)
+    result.truncated = truncated
+    return result
+
+
+EMPTY_HINT = (
+    "пустой ответ модели: лимит токенов ушёл на размышления. "
+    "Увеличьте LLM_MAX_TOKENS или задайте LLM_REASONING=off/low"
+)
+
+
+class LLMTruncatedError(LLMError):
+    """Ответ пустой из-за лимита токенов — повтор с тем же лимитом не поможет."""
+
+
 class LLMHTTPError(LLMError):
     def __init__(self, status: int, message: str):
         super().__init__(f"HTTP {status}: {message}")
@@ -77,7 +99,8 @@ class LLMClient:
         self.last_error = message
         self.last_error_at = time.time()
 
-    async def complete(self, system: str, user: str, max_tokens: int = 2000) -> str:
+    async def complete(self, system: str, user: str, max_tokens: int = 2000) -> LLMText:
+        max_tokens = max(max_tokens, self.cfg.max_tokens)
         async with self._sem:
             if self.paused:
                 # уже знаем, что запросы не проходят — не долбим API и не спамим лог
@@ -102,6 +125,10 @@ class LLMClient:
                             FATAL_PAUSE_SECONDS // 60,
                         )
                         raise LLMError(exc.message) from exc
+                except LLMTruncatedError as exc:
+                    self._fail(str(exc))
+                    log.warning("LLM %s: %s", self.cfg.provider, exc)
+                    raise
                 except (httpx.HTTPError, LLMError) as exc:
                     last_exc = exc
                 if attempt < 2:
@@ -111,12 +138,21 @@ class LLMClient:
             log.warning("LLM %s: запрос не удался после 3 попыток: %s", self.cfg.provider, message)
             raise LLMError(message) from last_exc
 
-    async def _complete(self, system: str, user: str, max_tokens: int) -> str:
+    async def _complete(self, system: str, user: str, max_tokens: int) -> LLMText:
         raise NotImplementedError
 
     async def complete_json(self, system: str, user: str, max_tokens: int = 2000) -> Any:
-        text = await self.complete(system, user, max_tokens)
-        return extract_json(text)
+        last: LLMError | None = None
+        for _ in range(2):  # модели иногда отвечают не JSON — пробуем ещё раз
+            text = await self.complete(system, user, max_tokens)
+            try:
+                return extract_json(text)
+            except LLMError as exc:
+                last = exc
+                if text.truncated:
+                    break  # обрезанный ответ повтор не исправит
+        assert last
+        raise last
 
 
 class OpenAICompatibleClient(LLMClient):
@@ -136,6 +172,11 @@ class OpenAICompatibleClient(LLMClient):
             "temperature": self.cfg.temperature,
             "max_tokens": max_tokens,
         }
+        if self.cfg.provider == "openrouter" and self.cfg.reasoning:
+            if self.cfg.reasoning in {"off", "none", "false", "0"}:
+                payload["reasoning"] = {"enabled": False}
+            else:
+                payload["reasoning"] = {"effort": self.cfg.reasoning, "exclude": True}
         resp = await self._http.post(
             f"{self.cfg.base_url}/chat/completions", headers=headers, json=payload
         )
@@ -145,12 +186,18 @@ class OpenAICompatibleClient(LLMClient):
         if "error" in data:
             raise LLMError(str(data["error"]))
         try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
+            choice = data["choices"][0]
+            content = choice["message"].get("content")
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
             raise LLMError(f"Неожиданный ответ: {str(data)[:300]}") from exc
         if isinstance(content, list):  # некоторые провайдеры отдают части
             content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-        return content or ""
+        truncated = choice.get("finish_reason") == "length"
+        if not (content or "").strip():
+            raise (LLMTruncatedError(EMPTY_HINT) if truncated else LLMError("пустой ответ модели"))
+        if truncated:
+            log.warning("LLM: ответ обрезан лимитом токенов (LLM_MAX_TOKENS=%s)", self.cfg.max_tokens)
+        return _text(content, truncated)
 
 
 class AnthropicClient(LLMClient):
@@ -172,7 +219,11 @@ class AnthropicClient(LLMClient):
             raise LLMHTTPError(resp.status_code, _error_message(resp))
         data = resp.json()
         parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
-        return "".join(parts)
+        truncated = data.get("stop_reason") == "max_tokens"
+        content = "".join(parts)
+        if not content.strip():
+            raise (LLMTruncatedError(EMPTY_HINT) if truncated else LLMError("пустой ответ модели"))
+        return _text(content, truncated)
 
 
 def build_llm(cfg: LLMConfig) -> LLMClient | None:
